@@ -26,8 +26,8 @@ from typing import Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
-VIDEOS_DIR = "videos"
-TRANSCRIPTS_DIR = "transcripts"
+VIDEOS_DIR = "data/videos"
+TRANSCRIPTS_DIR = "data/transcripts"
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 VIDEO_FORMAT = "mp4"

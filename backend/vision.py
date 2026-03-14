@@ -36,7 +36,7 @@ def _build_prompt(num_frames: int) -> str:
     """
     return f"""You are a product-detection assistant. You will be shown {num_frames} video frame(s) in order.
 
-For EACH frame identify every clearly visible brand, product, or purchasable item (clothing, electronics, food & beverage, vehicles, accessories, sporting goods, household items, etc.).
+For EACH frame identify every clearly visible PHYSICAL, PURCHASABLE product — things a viewer could actually buy (e.g. a camera, a desk lamp, a pair of shoes, a laptop, a food product, a water bottle, a piece of furniture).
 
 Return a JSON array of exactly {num_frames} objects — one per frame, same order as the images.
 Each object must follow this schema:
@@ -53,9 +53,16 @@ Each object must follow this schema:
 }}
 
 Rules:
-- Only include items you are reasonably confident about.
-- Set brand to null if the brand is not legible — do NOT omit the item.
-- If a frame has no identifiable products, return {{"items": []}}.
+- Only include PHYSICAL products that can be purchased.
+- EXCLUDE the following — do not include them under any circumstances:
+    • Software, apps, or app icons (e.g. YouTube app, iCloud icon, Mail icon, Launchpad)
+    • On-screen UI elements, operating system interfaces, or desktop widgets
+    • Videos, thumbnails, or other media content visible on a screen
+    • Websites, social media posts, or browser content
+    • Digital services or subscriptions
+    • People, faces, or text-only graphics
+- Set brand to null if the brand is not legible — do NOT omit the physical item.
+- If a frame has no identifiable physical products, return {{"items": []}}.
 - Do NOT wrap the array in any other key. Output raw JSON only."""
 
 
@@ -282,7 +289,7 @@ def _build_video_prompt(interval_seconds: float) -> str:
     """
     return f"""You are a product-detection assistant analyzing a video.
 
-Sample the video at every {interval_seconds:.1f} second(s) and identify every clearly visible brand, product, or purchasable item at each sample point (clothing, electronics, food & beverage, vehicles, accessories, sporting goods, household items, etc.).
+Sample the video at every {interval_seconds:.1f} second(s) and identify every clearly visible PHYSICAL, PURCHASABLE product at each sample point — things a viewer could actually buy (e.g. a camera, a desk lamp, a pair of shoes, a laptop, a food product, a water bottle, a piece of furniture).
 
 Return a JSON array where each element represents one sample point:
 
@@ -303,8 +310,15 @@ Return a JSON array where each element represents one sample point:
 
 Rules:
 - Include an entry for every sample point, even if items is [].
-- Only include items you are reasonably confident about.
-- Set brand to null if the brand is not legible — do NOT omit the item.
+- Only include PHYSICAL products that can be purchased.
+- EXCLUDE the following — do not include them under any circumstances:
+    • Software, apps, or app icons (e.g. YouTube app, iCloud icon, Mail icon, Launchpad)
+    • On-screen UI elements, operating system interfaces, or desktop widgets
+    • Videos, thumbnails, or other media content visible on a screen
+    • Websites, social media posts, or browser content
+    • Digital services or subscriptions
+    • People, faces, or text-only graphics
+- Set brand to null if the brand is not legible — do NOT omit the physical item.
 - Output raw JSON only — no markdown, no extra keys."""
 
 

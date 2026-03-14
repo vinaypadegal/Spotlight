@@ -2,7 +2,8 @@
 merge.py
 --------
 Fuses vision detections (from vision.py) with product/brand mentions found
-in the video transcript (from ingest.py).
+in the video transcript (from ingest.py), then emits a flat list of timed
+detection events ready for the frontend ad overlay.
 
 Pipeline
 --------
@@ -10,48 +11,55 @@ Pipeline
                           return every product/brand mention it can find, each
                           anchored to a transcript timestamp.
 
-2. merge()              — For each visually detected product:
-                          • Attach nearby transcript snippets as context.
-                          • If the brand was not identified visually, try to
-                            resolve it from a nearby transcript mention.
-                          • Mark detection_source as "vision", "transcript",
-                            or "both".
-                          Also surfaces products that were mentioned in the
-                          transcript but never detected visually.
+2. merge()              — Consolidates vision detections into time-windowed
+                          intervals, uses transcript mentions to resolve missing
+                          brands, then flattens everything into a sorted list
+                          of individual detection events.
+
+3. enrich_thumbnails()  — (stub) Fill in thumbnail_url for each detection.
+                          To be implemented in a later iteration.
 
 Output shape (merge return value)
 ----------------------------------
 {
-  "products": [
+  "video_id":  str,
+  "title":     str | null,
+  "duration":  float | null,   # video length in seconds
+  "status":    "complete",
+  "detections": [
     {
-      "name":                 str,
-      "brand":                str | null,
-      "brand_source":         "vision" | "transcript" | null,
-      "category":             str,
-      "confidence":           float | null,   # from vision; null if transcript-only
-      "first_seen_at":        float,          # earliest timestamp in seconds
-      "timestamps":           [float],        # all vision timestamps
-      "transcript_mentions":  [               # nearby transcript hits
-        { "timestamp": float, "context": str, "brand": str | null }
-      ],
-      "detection_source":     "vision" | "transcript" | "both",
+      "id":           "det_001",   # sequential, zero-padded, sorted by show_at
+      "name":         str,
+      "brand":        str | null,
+      "category":     str,
+      "show_at":      float,       # seconds — when to show the ad overlay
+      "hide_at":      float,       # seconds — when to hide it
+      "confidence":   float | null,
+      "shopping_url": str | null,  # Google Shopping search URL
+      "thumbnail_url": null        # populated by enrich_thumbnails()
     },
     ...
   ],
   "summary": {
-    "total_products":        int,
-    "vision_only":           int,
-    "transcript_only":       int,
-    "both":                  int,
-    "brand_resolved_count":  int,   # brands filled in from transcript
+    "total_products":       int,
+    "total_detections":     int,
+    "brand_resolved_count": int
   }
 }
+
+Detection windowing rules
+--------------------------
+• Each raw vision timestamp spawns a window [ts, ts + DETECTION_WINDOW_S].
+• If a subsequent timestamp falls within MERGE_GAP_S seconds of the current
+  window's end, the window is extended: end = max(end, ts + DETECTION_WINDOW_S).
+• Otherwise a new detection window is started.
 """
 
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+from urllib.parse import quote_plus
 
 from google import genai
 from google.genai import types
@@ -60,34 +68,108 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# How many seconds before/after a vision frame's timestamp to search for
-# relevant transcript context.
-DEFAULT_CONTEXT_WINDOW = 15.0
+# Default duration to extend a detection window past a frame timestamp.
+DETECTION_WINDOW_S: float = 5.0
+
+# If the next raw timestamp is within this many seconds of the current window's
+# end, the windows are merged rather than creating a new detection.
+MERGE_GAP_S: float = 10.0
+
+# Seconds before/after a transcript mention's timestamp to search for a
+# matching vision product (used in time-aware matching).
+DEFAULT_CONTEXT_WINDOW: float = 15.0
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_nearby_snippets(
-    snippets: List[Dict],
-    timestamp: float,
-    window: float,
-) -> Tuple[str, List[Dict]]:
+def _shopping_url(name: str, brand: Optional[str]) -> Optional[str]:
+    """Build a Google Shopping search URL for a product."""
+    query = f"{brand} {name}".strip() if brand else name.strip()
+    if not query:
+        return None
+    return f"https://www.google.com/search?tbm=shop&q={quote_plus(query)}"
+
+
+def _build_detections(
+    timestamps: List[float],
+    detection_window: float = DETECTION_WINDOW_S,
+    merge_gap: float = MERGE_GAP_S,
+) -> List[Dict]:
     """
-    Return transcript snippets whose start time falls within
-    [timestamp - window, timestamp + window] and a single joined text string.
+    Collapse a list of raw frame timestamps into merged detection windows.
+
+    Algorithm:
+      1. Sort timestamps.
+      2. Open a window [ts, ts + detection_window] at the first timestamp.
+      3. For each subsequent ts:
+           - If ts < current_end + merge_gap  →  extend: end = max(end, ts + detection_window)
+           - Otherwise                         →  save the current window, open a new one.
+      4. Save the final window.
+
+    Returns a list of {"show_at": float, "hide_at": float} dicts.
     """
-    nearby = [s for s in snippets if abs(s["start"] - timestamp) <= window]
-    text = " ".join(s["text"] for s in nearby).strip()
-    return text, nearby
+    if not timestamps:
+        return []
+
+    sorted_ts = sorted(timestamps)
+    detections: List[Dict] = []
+
+    start = sorted_ts[0]
+    end   = start + detection_window
+
+    for ts in sorted_ts[1:]:
+        if ts < end + merge_gap:
+            end = max(end, ts + detection_window)
+        else:
+            detections.append({"show_at": round(start, 3), "hide_at": round(end, 3)})
+            start = ts
+            end   = ts + detection_window
+
+    detections.append({"show_at": round(start, 3), "hide_at": round(end, 3)})
+    return detections
+
+
+def _name_matches(a: str, b: str) -> bool:
+    """Return True if one name is a substring of the other (case-insensitive)."""
+    a, b = a.lower(), b.lower()
+    return a in b or b in a
+
+
+def _find_matching_key(
+    registry: Dict[str, Dict],
+    m_name: str,
+    m_ts: float,
+    context_window: float,
+) -> Optional[str]:
+    """
+    Find the registry key whose product best matches a transcript mention.
+
+    Matching is done in two passes:
+      1. Time-aware  — name matches AND any of the product's vision timestamps
+                       fall within context_window seconds of m_ts.
+      2. Name-only   — name matches regardless of timestamp (fallback for
+                       cases where the transcript timestamp is imprecise).
+
+    Returns the first matching key, or None.
+    """
+    # Pass 1: time-aware (preferred)
+    for key, entry in registry.items():
+        if not _name_matches(m_name, entry["name"]):
+            continue
+        if any(abs(ts - m_ts) <= context_window for ts in entry["_raw_timestamps"]):
+            return key
+
+    # Pass 2: name-only fallback
+    # for key, entry in registry.items():
+    #     if _name_matches(m_name, entry["name"]):
+    #         return key
+
+    return None
 
 
 def _build_extraction_prompt(timestamped_transcript: str) -> str:
-    """
-    Prompt that asks Gemini to extract structured product/brand mentions from
-    a timestamped transcript.
-    """
     return f"""You are a product and brand extraction assistant.
 
 Analyze the following video transcript (each line is prefixed with its timestamp in [MM:SS.ss] format) and identify every product name and brand mention.
@@ -96,15 +178,13 @@ For each mention return:
 - name: the product or item being discussed
 - brand: the brand name if mentioned in the transcript; null if not explicitly named
 - timestamp: the time in seconds when it is first mentioned (convert from the [MM:SS.ss] prefix)
-- context: the exact 1–2 sentence quote from the transcript where this product/brand is mentioned
 
 Return a JSON array:
 [
   {{
     "name": "product name",
     "brand": "brand name or null",
-    "timestamp": <float seconds>,
-    "context": "exact quote"
+    "timestamp": <float seconds>
   }}
 ]
 
@@ -131,12 +211,11 @@ def extract_mentions(
     Args:
         transcript_data: Output of get_transcript() — must contain:
                            'transcript': list of {text, start, duration}
-                           'text':        plain-text version (used for logging only)
+                           'text':        plain-text version (for logging)
         api_key:         Gemini API key; falls back to GEMINI_API_KEY env var.
 
     Returns:
-        List of dicts: [{name, brand, timestamp, context}, ...]
-        Each dict represents one product/brand mention found in the transcript.
+        List of {name, brand, timestamp} dicts — one per mention found.
     """
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -147,8 +226,6 @@ def extract_mentions(
         logger.warning("No transcript snippets provided — skipping mention extraction")
         return []
 
-    # Build a human-readable timestamped transcript for the model.
-    # Format: [MM:SS.ss] text
     lines = []
     for s in snippets:
         mins = int(s["start"] // 60)
@@ -182,30 +259,42 @@ def extract_mentions(
 def merge(
     vision_frames: List[Dict],
     transcript_data: Optional[Dict],
+    video_id: Optional[str] = None,
+    title: Optional[str] = None,
+    duration: Optional[float] = None,
     context_window: float = DEFAULT_CONTEXT_WINDOW,
+    detection_window: float = DETECTION_WINDOW_S,
+    merge_gap: float = MERGE_GAP_S,
     api_key: Optional[str] = None,
 ) -> Dict:
     """
-    Merge vision detections with transcript product/brand mentions.
+    Merge vision detections with transcript product/brand mentions and emit
+    a flat list of timed detection events, sorted by show_at.
 
     Args:
-        vision_frames:   Output of analyze_frames() / analyze_youtube_url() —
-                         list of {timestamp, frame_path, products} dicts.
-        transcript_data: Output of get_transcript() — has 'transcript' and 'text'.
-                         Pass None to skip transcript enrichment entirely.
-        context_window:  Seconds before/after each vision frame to look for
-                         matching transcript snippets (default 15s).
-        api_key:         Gemini API key; falls back to GEMINI_API_KEY env var.
+        vision_frames:    Output of analyze_frames() / analyze_youtube_url().
+        transcript_data:  Output of get_transcript(). Pass None to skip
+                          transcript enrichment.
+        video_id:         YouTube video ID (included in output for reference).
+        title:            Video title (included in output; optional).
+        duration:         Video duration in seconds (included in output; optional).
+        context_window:   Seconds around a transcript mention's timestamp used
+                          when matching it to a vision detection (default 15s).
+        detection_window: Duration (seconds) to extend each detection past its
+                          frame timestamp (default 5s).
+        merge_gap:        Max gap (seconds) between a new timestamp and the
+                          current window's end before a new window is opened
+                          (default 10s).
+        api_key:          Gemini API key; falls back to GEMINI_API_KEY env var.
 
     Returns:
         See module docstring for the full output schema.
     """
-    snippets: List[Dict] = []
+    # -------------------------------------------------------------------
+    # Step 1: Extract product/brand mentions from transcript
+    # -------------------------------------------------------------------
     transcript_mentions: List[Dict] = []
-
-    # --- Step 1: extract structured mentions from transcript ---
     if transcript_data:
-        snippets = transcript_data.get("transcript", [])
         try:
             transcript_mentions = extract_mentions(transcript_data, api_key=api_key)
         except Exception as e:
@@ -214,9 +303,10 @@ def merge(
             )
 
     # -------------------------------------------------------------------
-    # Step 2: seed the product registry from vision detections
-    # Each entry is keyed by normalised "name|brand" so the same product
-    # appearing in multiple frames is consolidated into one record.
+    # Step 2: Seed the product registry from vision detections.
+    #
+    # Internal registry fields (stripped before output):
+    #   _raw_timestamps  — all raw frame timestamps for this product
     # -------------------------------------------------------------------
     registry: Dict[str, Dict] = {}
 
@@ -224,91 +314,62 @@ def merge(
         ts: float = frame["timestamp"]
 
         for product in frame.get("products", []):
-            name = (product.get("name") or "").strip()
+            name  = (product.get("name")  or "").strip()
             brand = (product.get("brand") or "").strip()
-            if not name:
+            if not name or not brand:
                 continue
 
-            # Use lowercased name+brand as the dedup key.
-            # Products without a brand get a key ending in "|" so they can be
-            # updated later if the brand is resolved from the transcript.
             key = f"{name.lower()}|{brand.lower()}"
 
             if key not in registry:
                 registry[key] = {
-                    "name": name,
-                    "brand": brand or None,
-                    "brand_source": "vision" if brand else None,
-                    "category": product.get("category", "other"),
-                    "confidence": product.get("confidence"),
-                    "first_seen_at": ts,
-                    "timestamps": [ts],
-                    "transcript_mentions": [],
-                    "detection_source": "vision",
+                    "name":            name,
+                    "brand":           brand or None,
+                    "category":        product.get("category", "other"),
+                    "confidence":      product.get("confidence"),
+                    "_raw_timestamps": [ts],
                 }
             else:
                 entry = registry[key]
-                entry["timestamps"].append(ts)
-                if ts < entry["first_seen_at"]:
-                    entry["first_seen_at"] = ts
-                # Take the highest confidence seen across frames
+                entry["_raw_timestamps"].append(ts)
                 if (
                     product.get("confidence") is not None
-                    and (entry["confidence"] is None or product["confidence"] > entry["confidence"])
+                    and (
+                        entry["confidence"] is None
+                        or product["confidence"] > entry["confidence"]
+                    )
                 ):
                     entry["confidence"] = product["confidence"]
 
     # -------------------------------------------------------------------
-    # Step 3: enrich registry with transcript mentions
+    # Step 3: Enrich registry with transcript mentions
     # -------------------------------------------------------------------
     brand_resolved_count = 0
     transcript_only_count = 0
 
     for mention in transcript_mentions:
-        m_name = (mention.get("name") or "").strip()
+        m_name  = (mention.get("name")  or "").strip()
         m_brand = (mention.get("brand") or "").strip()
-        m_ts = float(mention.get("timestamp") or 0.0)
-        m_context = (mention.get("context") or "").strip()
+        m_ts    = float(mention.get("timestamp") or 0.0)
 
         if not m_name:
             continue
 
-        mention_payload = {
-            "timestamp": m_ts,
-            "context": m_context,
-            "brand": m_brand or None,
-        }
-
-        # --- Try to match this mention to an existing vision detection ---
-        # Matching rule: one name is a substring of the other (case-insensitive).
-        # This is intentionally lenient — e.g. "Air Max" matches "Nike Air Max 90".
-        matched_key: Optional[str] = None
-        m_name_lower = m_name.lower()
-
-        for key, entry in registry.items():
-            entry_name_lower = entry["name"].lower()
-            if m_name_lower in entry_name_lower or entry_name_lower in m_name_lower:
-                matched_key = key
-                break
+        matched_key = _find_matching_key(registry, m_name, m_ts, context_window)
 
         if matched_key:
             entry = registry[matched_key]
-            entry["transcript_mentions"].append(mention_payload)
-            entry["detection_source"] = "both"
 
             # Resolve missing brand from transcript
             if not entry["brand"] and m_brand:
                 old_key = matched_key
-                # Re-key the registry entry with the resolved brand
                 new_key = f"{entry['name'].lower()}|{m_brand.lower()}"
                 entry["brand"] = m_brand
-                entry["brand_source"] = "transcript"
                 brand_resolved_count += 1
                 logger.debug(
                     "Brand resolved from transcript: '%s' → '%s'",
                     entry["name"], m_brand,
                 )
-                # Move to the new key if it doesn't already exist
                 if new_key not in registry:
                     registry[new_key] = entry
                     del registry[old_key]
@@ -317,42 +378,103 @@ def merge(
             key = f"{m_name.lower()}|{m_brand.lower()}"
             if key not in registry:
                 registry[key] = {
-                    "name": m_name,
-                    "brand": m_brand or None,
-                    "brand_source": "transcript" if m_brand else None,
-                    "category": "other",
-                    "confidence": None,
-                    "first_seen_at": m_ts,
-                    "timestamps": [],
-                    "transcript_mentions": [mention_payload],
-                    "detection_source": "transcript",
+                    "name":            m_name,
+                    "brand":           m_brand or None,
+                    "category":        "other",
+                    "confidence":      None,
+                    "_raw_timestamps": [m_ts],
                 }
                 transcript_only_count += 1
-            else:
-                # Already registered (e.g. duplicate mention) — just append
-                registry[key]["transcript_mentions"].append(mention_payload)
 
     # -------------------------------------------------------------------
-    # Step 4: sort by first appearance and build summary
+    # Step 4: Flatten into a sorted list of individual detection events.
+    #
+    # Each (product, detection_window) pair becomes its own entry so the
+    # frontend can treat every row as an independent "show ad at T" event.
+    # IDs are assigned after sorting by show_at.
     # -------------------------------------------------------------------
-    product_list = sorted(registry.values(), key=lambda p: p["first_seen_at"])
+    flat: List[Dict] = []
 
-    vision_only = sum(1 for p in product_list if p["detection_source"] == "vision")
-    both = sum(1 for p in product_list if p["detection_source"] == "both")
+    for entry in registry.values():
+        raw_ts  = entry.pop("_raw_timestamps", [])
+        windows = _build_detections(raw_ts, detection_window, merge_gap)
+
+        shop_url = _shopping_url(entry["name"], entry["brand"])
+
+        for window in windows:
+            flat.append({
+                "name":          entry["name"],
+                "brand":         entry["brand"],
+                "category":      entry["category"],
+                "show_at":       window["show_at"],
+                "hide_at":       window["hide_at"],
+                "confidence":    entry["confidence"],
+                "shopping_url":  shop_url,
+                "thumbnail_url": None,  # populated by enrich_thumbnails()
+            })
+
+    # Sort by show_at, then assign sequential IDs
+    flat.sort(key=lambda d: d["show_at"])
+    for i, det in enumerate(flat, start=1):
+        det["id"] = f"det_{i:03d}"
+
+    # Re-order keys so id comes first (cosmetic)
+    detections = [
+        {
+            "id":            d["id"],
+            "name":          d["name"],
+            "brand":         d["brand"],
+            "category":      d["category"],
+            "show_at":       d["show_at"],
+            "hide_at":       d["hide_at"],
+            "confidence":    d["confidence"],
+            "shopping_url":  d["shopping_url"],
+            "thumbnail_url": d["thumbnail_url"],
+        }
+        for d in flat
+    ]
+
+    # Unique product count = number of distinct name|brand combinations
+    unique_products = len(registry)
 
     logger.info(
-        "Merge complete — %d total products "
-        "(%d vision-only, %d transcript-only, %d both, %d brands resolved from transcript)",
-        len(product_list), vision_only, transcript_only_count, both, brand_resolved_count,
+        "Merge complete — %d detections across %d products "
+        "(%d transcript-only, %d brands resolved from transcript)",
+        len(detections), unique_products, transcript_only_count, brand_resolved_count,
     )
 
     return {
-        "products": product_list,
+        "video_id":   video_id,
+        "title":      title,
+        "duration":   duration,
+        "status":     "complete",
+        "detections": detections,
         "summary": {
-            "total_products": len(product_list),
-            "vision_only": vision_only,
-            "transcript_only": transcript_only_count,
-            "both": both,
+            "total_products":       unique_products,
+            "total_detections":     len(detections),
             "brand_resolved_count": brand_resolved_count,
         },
     }
+
+
+def enrich_thumbnails(result: Dict, api_key: Optional[str] = None) -> Dict:
+    """
+    Populate thumbnail_url for each detection in a merge() result.
+
+    This is a stub — the actual implementation will query a product image API
+    (e.g. Google Custom Search, SerpAPI, or similar) to find a representative
+    thumbnail for each brand + product name and fill in the thumbnail_url field.
+
+    Args:
+        result:  Output of merge() — modified in-place and also returned.
+        api_key: API key for the thumbnail service (TBD).
+
+    Returns:
+        The same result dict with thumbnail_url fields populated where possible.
+    """
+    # TODO: implement thumbnail fetching
+    # Suggested approach:
+    #   for det in result["detections"]:
+    #       det["thumbnail_url"] = _fetch_thumbnail(det["brand"], det["name"], api_key)
+    logger.warning("enrich_thumbnails() is not yet implemented — thumbnail_url remains null")
+    return result

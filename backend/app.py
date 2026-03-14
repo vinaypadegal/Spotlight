@@ -25,7 +25,8 @@ from ingest import (
     get_transcript,
     get_video_with_transcript,
     extract_video_id,
-    download_video
+    download_video,
+    VIDEOS_DIR,
 )
 from frames import extract_frames
 from vision import analyze_frames, analyze_youtube_url
@@ -276,11 +277,11 @@ async def extract_video_frames(
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
 
-        video_path = f"data/videos/{video_id}.mp4"
+        video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
 
         # Always (re-)download — yt-dlp will overwrite the file if it exists,
         # ensuring the local copy is never stale.
-        download_video(video_url, download_path="videos", format="mp4")
+        download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
 
         frames = extract_frames(
             video_path=video_path,
@@ -358,10 +359,10 @@ async def analyze_video_frames(
             )
         else:
             # --- Full path: download → extract frames → Gemini ---
-            video_path = f"data/videos/{video_id}.mp4"
+            video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
 
             # Always (re-)download so the local copy is never stale
-            download_video(video_url, download_path="videos", format="mp4")
+            download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
 
             # Extract frames at the requested interval
             frames = extract_frames(
@@ -427,29 +428,40 @@ async def run_pipeline(request_body: PipelineRequest):
     if not video_id:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
 
+    import time as _time
+    _pipeline_start = _time.perf_counter()
     logger.info("=== Pipeline start: video_id='%s', interval=%.1fs ===", video_id, interval)
 
     # ------------------------------------------------------------------
-    # Step 1: Download video
+    # Step 1: Download video + fetch metadata (title, duration)
     # ------------------------------------------------------------------
+    video_title: Optional[str] = None
+    video_duration: Optional[float] = None
+
     try:
         logger.info("[1/5] Downloading video...")
-        download_result = download_video(video_url, download_path="videos", format="mp4")
+        download_result = download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
+        video_title    = download_result.get("title")
+        video_duration = download_result.get("duration")
         steps["download"] = {
-            "status": "done",
+            "status":     "done",
             "video_path": download_result.get("file_path"),
+            "title":      video_title,
+            "duration":   video_duration,
         }
-        logger.info("[1/5] Download complete → %s", download_result.get("file_path"))
+        logger.info(
+            "[1/5] Download complete → %s (title='%s', duration=%ss)",
+            download_result.get("file_path"), video_title, video_duration,
+        )
     except Exception as e:
         logger.error("[1/5] Download failed: %s", e)
         steps["download"] = {"status": "failed", "error": str(e)}
-        # Cannot continue without the video
         raise HTTPException(
             status_code=500,
             detail=f"Pipeline failed at download step: {e}",
         )
 
-    video_path = f"data/videos/{video_id}.mp4"
+    video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
 
     # ------------------------------------------------------------------
     # Step 2: Transcript
@@ -508,7 +520,6 @@ async def run_pipeline(request_body: PipelineRequest):
     try:
         logger.info("[4/5] Running Gemini Vision on %d frames...", len(frames))
         vision_result = analyze_frames(frames)
-        logger.info(vision_result)
         summary = vision_result.get("summary", {})
         steps["vision"] = {
             "status": "done",
@@ -537,19 +548,21 @@ async def run_pipeline(request_body: PipelineRequest):
         merge_result = merge_results(
             vision_frames=vision_result.get("frames", []),
             transcript_data=transcript_data,   # None if transcript was skipped
+            video_id=video_id,
+            title=video_title,
+            duration=video_duration,
         )
         merge_summary = merge_result.get("summary", {})
         steps["integration"] = {
             "status": "done",
             "total_products": merge_summary.get("total_products", 0),
-            "vision_only": merge_summary.get("vision_only", 0),
-            "transcript_only": merge_summary.get("transcript_only", 0),
-            "both": merge_summary.get("both", 0),
+            "total_detections": merge_summary.get("total_detections", 0),
             "brand_resolved_count": merge_summary.get("brand_resolved_count", 0),
         }
         logger.info(
-            "[5/5] Merge done — %d products total (%d brands resolved from transcript)",
+            "[5/5] Merge done — %d products, %d detections, %d brands resolved from transcript",
             merge_summary.get("total_products", 0),
+            merge_summary.get("total_detections", 0),
             merge_summary.get("brand_resolved_count", 0),
         )
     except Exception as e:
@@ -557,22 +570,31 @@ async def run_pipeline(request_body: PipelineRequest):
         steps["integration"] = {"status": "failed", "error": str(e)}
         # Non-fatal — still return vision + transcript raw results
 
-    logger.info("=== Pipeline complete: video_id='%s' ===", video_id)
+    elapsed = round(_time.perf_counter() - _pipeline_start, 2)
+    logger.info(
+        "=== Pipeline complete: video_id='%s' in %.2fs ===",
+        video_id, elapsed,
+    )
 
     # ------------------------------------------------------------------
     # Build response
+    # merge_result already contains video_id, title, duration, status,
+    # detections[], and summary — surface it directly as the primary output.
     # ------------------------------------------------------------------
     return {
         "success": True,
         "data": {
-            "video_id": video_id,
-            "interval_seconds": interval,
-            # Per-step status summary
+            # Primary output — ready for the frontend ad overlay
+            **(merge_result or {
+                "video_id": video_id,
+                "title":    video_title,
+                "duration": video_duration,
+                "status":   "partial",
+                "detections": [],
+            }),
+            # Pipeline step diagnostics
             "steps": steps,
-            # Fully hydrated outputs
-            "merged": merge_result,        # primary output — fused product list
-            "transcript": transcript_data, # raw transcript (for reference)
-            "vision": vision_result,       # raw per-frame detections (for reference)
+            "elapsed_seconds": elapsed,
         },
     }
 

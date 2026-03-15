@@ -26,8 +26,11 @@ from typing import Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
-VIDEOS_DIR = "data/videos"
-TRANSCRIPTS_DIR = "data/transcripts"
+# Anchor data directories to the project root so paths are consistent
+# regardless of which working directory the server is launched from.
+_PROJECT_ROOT = Path(__file__).parent.parent
+VIDEOS_DIR      = str(_PROJECT_ROOT / "data" / "videos")
+TRANSCRIPTS_DIR = str(_PROJECT_ROOT / "data" / "transcripts")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 VIDEO_FORMAT = "mp4"

@@ -1,224 +1,169 @@
-import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import React, { useState, useCallback } from 'react';
+import Header from './components/Header';
+import Sidebar from './components/Sidebar';
+import HomePage from './components/HomePage';
+import WatchPage from './components/WatchPage';
 import './App.css';
 
-function App() {
-  const [healthStatus, setHealthStatus] = useState('');
-  const [videoUrl, setVideoUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [videoData, setVideoData] = useState(null);
-  const [transcriptData, setTranscriptData] = useState(null);
-  const [error, setError] = useState('');
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function extractVideoId(url) {
+  if (!url) return null;
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+    /^([a-zA-Z0-9_-]{11})$/,
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
 
-  useEffect(() => {
-    // Check backend health
-    axios.get('/api/health')
-      .then(response => {
-        setHealthStatus(response.data.status);
-      })
-      .catch(error => {
-        console.error('Error connecting to backend:', error);
-        setHealthStatus('disconnected');
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+export default function App() {
+  const [sidebarOpen, setSidebarOpen]       = useState(true);
+  const [view, setView]                     = useState('home');       // 'home' | 'watch'
+  const [videoId, setVideoId]               = useState(null);
+  const [videoInfo, setVideoInfo]           = useState(null);
+  const [currentTime, setCurrentTime]       = useState(0);
+  const [detections, setDetections]         = useState([]);
+  const [panelOpen, setPanelOpen]           = useState(false);
+  const [pipelineStatus, setPipelineStatus] = useState('idle');
+  const [searchValue, setSearchValue]       = useState('');
+
+  // Products visible at the current playback time, newest appearance first
+  const activeProducts = detections
+    .filter((d) => currentTime >= d.show_at && currentTime <= d.hide_at)
+    .sort((a, b) => b.show_at - a.show_at);
+
+  // ── Load a video (by URL or ID) ──────────────────────────────────────────
+  const loadVideo = useCallback(async (urlOrId) => {
+    const vid = extractVideoId(urlOrId);
+    if (!vid) return;
+
+    setVideoId(vid);
+    setView('watch');
+    setCurrentTime(0);
+    setDetections([]);
+    setPanelOpen(false);
+    setVideoInfo(null);
+    setPipelineStatus('loading');
+
+    // Kick off video-info fetch in the background (non-blocking)
+    fetch('/api/youtube/video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: urlOrId }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data?.data) setVideoInfo(data.data); })
+      .catch(() => {});
+
+    // 1️⃣  Try cached detections first — instant load
+    try {
+      const res = await fetch(`/api/youtube/detections/${vid}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDetections(data.data?.detections || []);
+        setPipelineStatus('done');
+        return;
+      }
+    } catch (_) {}
+
+    // 2️⃣  No cache — auto-run the full pipeline
+    try {
+      const res = await fetch('/api/youtube/pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: vid }),
       });
+      if (!res.ok) throw new Error('Pipeline request failed');
+      const data = await res.json();
+      setDetections(data.data?.detections || []);
+      // Back-fill videoInfo from pipeline response if video-info fetch lost the race
+      if (data.data?.title) {
+        setVideoInfo((prev) => prev || { title: data.data.title, duration: data.data.duration });
+      }
+      setPipelineStatus('done');
+    } catch (err) {
+      console.error('Pipeline error:', err);
+      setPipelineStatus('error');
+    }
   }, []);
 
-  const fetchVideoInfo = async () => {
-    if (!videoUrl.trim()) {
-      setError('Please enter a YouTube URL or video ID');
-      return;
-    }
+  // ── Search bar "Watch" action ────────────────────────────────────────────
+  const handleSearch = useCallback((value) => {
+    if (!value?.trim()) return;
+    loadVideo(value.trim());
+    setSearchValue('');
+  }, [loadVideo]);
 
-    setLoading(true);
-    setError('');
-    setVideoData(null);
-    setTranscriptData(null);
-
+  // ── Re-run pipeline (manual "Re-analyse" button) ─────────────────────────
+  const runPipeline = useCallback(async () => {
+    if (!videoId || pipelineStatus === 'loading') return;
+    setPipelineStatus('loading');
+    setDetections([]);
     try {
-      const response = await axios.post('/api/youtube/video', { url: videoUrl });
-      setVideoData(response.data.data);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Error fetching video information');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchTranscript = async () => {
-    if (!videoUrl.trim()) {
-      setError('Please enter a YouTube URL or video ID');
-      return;
-    }
-
-    setLoading(true);
-    setError('');
-    setTranscriptData(null);
-
-    try {
-      const response = await axios.post('/api/youtube/transcript', { url: videoUrl });
-      setTranscriptData(response.data.data);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Error fetching transcript');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchVideoWithTranscript = async () => {
-    if (!videoUrl.trim()) {
-      setError('Please enter a YouTube URL or video ID');
-      return;
-    }
-
-    setLoading(true);
-    setError('');
-    setVideoData(null);
-    setTranscriptData(null);
-
-    try {
-      const response = await axios.post('/api/youtube/video-with-transcript', { url: videoUrl });
-      setVideoData(response.data.data);
-      if (response.data.data.transcript) {
-        setTranscriptData(response.data.data.transcript);
+      const res = await fetch('/api/youtube/pipeline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: videoId }),
+      });
+      if (!res.ok) throw new Error('Pipeline request failed');
+      const data = await res.json();
+      setDetections(data.data?.detections || []);
+      if (!videoInfo && data.data?.title) {
+        setVideoInfo({ title: data.data.title, duration: data.data.duration });
       }
+      setPipelineStatus('done');
     } catch (err) {
-      setError(err.response?.data?.error || 'Error fetching video and transcript');
-    } finally {
-      setLoading(false);
+      console.error('Pipeline error:', err);
+      setPipelineStatus('error');
     }
-  };
+  }, [videoId, pipelineStatus, videoInfo]);
 
-  const formatDuration = (seconds) => {
-    if (!seconds) return 'N/A';
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
-  };
-
-  const formatNumber = (num) => {
-    if (!num) return 'N/A';
-    return num.toLocaleString();
-  };
+  // ── Time update from VideoPlayer ─────────────────────────────────────────
+  const handleTimeUpdate = useCallback((t) => setCurrentTime(t), []);
 
   return (
-    <div className="App">
-      <header className="App-header">
-        <h1>Spotlight - YouTube Video & Transcript Fetcher</h1>
-        <div className="status">
-          <p>Backend Status: <span className={healthStatus}>{healthStatus}</span></p>
-        </div>
+    <div className="yt-app">
+      {/* Fixed top header */}
+      <Header
+        onMenuClick={() => setSidebarOpen((o) => !o)}
+        searchValue={searchValue}
+        onSearchChange={setSearchValue}
+        onSearch={handleSearch}
+      />
 
-        <div className="input-section">
-          <input
-            type="text"
-            placeholder="Enter YouTube URL or Video ID"
-            value={videoUrl}
-            onChange={(e) => setVideoUrl(e.target.value)}
-            className="url-input"
-            onKeyPress={(e) => e.key === 'Enter' && fetchVideoWithTranscript()}
-          />
-          <div className="button-group">
-            <button 
-              onClick={fetchVideoInfo} 
-              className="btn-primary"
-              disabled={loading}
-            >
-              Get Video Info
-            </button>
-            <button 
-              onClick={fetchTranscript} 
-              className="btn-primary"
-              disabled={loading}
-            >
-              Get Transcript
-            </button>
-            <button 
-              onClick={fetchVideoWithTranscript} 
-              className="btn-primary btn-fetch-all"
-              disabled={loading}
-            >
-              Get Both
-            </button>
-          </div>
-        </div>
+      {/* Body: sidebar + main */}
+      <div className="yt-body">
+        <Sidebar isOpen={sidebarOpen} />
 
-        {loading && (
-          <div className="loading">Loading...</div>
-        )}
-
-        {error && (
-          <div className="error-message">
-            <p>{error}</p>
-          </div>
-        )}
-
-        {videoData && (
-          <div className="video-info">
-            <h2>Video Information</h2>
-            {videoData.thumbnail && (
-              <img src={videoData.thumbnail} alt="Video thumbnail" className="thumbnail" />
-            )}
-            <div className="info-grid">
-              <div><strong>Title:</strong> {videoData.title}</div>
-              <div><strong>Channel:</strong> {videoData.uploader}</div>
-              <div><strong>Duration:</strong> {formatDuration(videoData.duration)}</div>
-              <div><strong>Views:</strong> {formatNumber(videoData.view_count)}</div>
-              <div><strong>Likes:</strong> {formatNumber(videoData.like_count)}</div>
-              <div><strong>Upload Date:</strong> {videoData.upload_date || 'N/A'}</div>
-              <div><strong>Video ID:</strong> {videoData.video_id}</div>
-            </div>
-            {videoData.description && (
-              <div className="description">
-                <strong>Description:</strong>
-                <p>{videoData.description.substring(0, 300)}{videoData.description.length > 300 ? '...' : ''}</p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {transcriptData && (
-          <div className="transcript-info">
-            <h2>Transcript</h2>
-            <div className="transcript-meta">
-              <p><strong>Language:</strong> {transcriptData.language}</p>
-              <p><strong>Word Count:</strong> {transcriptData.word_count}</p>
-              {transcriptData.available_languages && transcriptData.available_languages.length > 0 && (
-                <div>
-                  <strong>Available Languages:</strong>
-                  <ul className="language-list">
-                    {transcriptData.available_languages.map((lang, idx) => (
-                      <li key={idx}>
-                        {lang.language} ({lang.language_code})
-                        {lang.is_generated && ' [Auto-generated]'}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-            <div className="transcript-text">
-              <h3>Transcript Text:</h3>
-              <p>{transcriptData.text}</p>
-            </div>
-            {transcriptData.transcript && (
-              <div className="transcript-timestamps">
-                <h3>Transcript with Timestamps:</h3>
-                <div className="transcript-items">
-                  {transcriptData.transcript.map((item, idx) => (
-                    <div key={idx} className="transcript-item">
-                      <span className="timestamp">
-                        [{Math.floor(item.start)}s - {Math.floor(item.start + item.duration)}s]
-                      </span>
-                      <span className="text">{item.text}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </header>
+        <main
+          className={`yt-main ${sidebarOpen ? 'sidebar-open' : 'sidebar-collapsed'} ${panelOpen ? 'panel-open' : ''}`}
+        >
+          {view === 'home' ? (
+            <HomePage onWatch={loadVideo} />
+          ) : (
+            <WatchPage
+              videoId={videoId}
+              videoInfo={videoInfo}
+              onTimeUpdate={handleTimeUpdate}
+              currentTime={currentTime}
+              pipelineStatus={pipelineStatus}
+              onRunPipeline={runPipeline}
+              activeProducts={activeProducts}
+              panelOpen={panelOpen}
+              onCartToggle={() => setPanelOpen((o) => !o)}
+              onPanelClose={() => setPanelOpen(false)}
+            />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
-
-export default App;

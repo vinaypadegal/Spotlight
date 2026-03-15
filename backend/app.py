@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 import os
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,7 +42,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["http://localhost:3000"],  # In production, replace with specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -597,6 +598,24 @@ async def run_pipeline(request_body: PipelineRequest):
             "elapsed_seconds": elapsed,
         },
     }
+
+
+@app.get("/api/youtube/detections/{video_id}")
+async def get_cached_detections(video_id: str):
+    """
+    Serve cached detection results from data/detections/<video_id>.json.
+    Returns 404 if the pipeline has not been run for this video yet.
+    """
+    import json as _json
+    detections_path = Path(__file__).parent.parent / "data" / "detections" / f"{video_id}.json"
+    if not detections_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached detections found for '{video_id}'. Run the pipeline first.",
+        )
+    with open(detections_path, "r", encoding="utf-8") as fh:
+        data = _json.load(fh)
+    return {"success": True, "data": data}
 
 
 if __name__ == '__main__':

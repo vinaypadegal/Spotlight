@@ -10,7 +10,9 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-FRAMES_DIR = "data/frames"
+# Anchor to project root so the path is consistent regardless of launch directory
+_PROJECT_ROOT = Path(__file__).parent.parent
+FRAMES_DIR = str(_PROJECT_ROOT / "data" / "frames")
 os.makedirs(FRAMES_DIR, exist_ok=True)
 
 

@@ -69,7 +69,9 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-DETECTIONS_DIR = "data/detections"
+# Anchor to project root so the path is consistent regardless of launch directory
+_PROJECT_ROOT = Path(__file__).parent.parent
+DETECTIONS_DIR = str(_PROJECT_ROOT / "data" / "detections")
 os.makedirs(DETECTIONS_DIR, exist_ok=True)
 
 # Default duration to extend a detection window past a frame timestamp.

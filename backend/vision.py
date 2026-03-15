@@ -29,14 +29,33 @@ MAX_WORKERS = 4
 # Helpers
 # -------------------------------------------------------------------------
 
-def _build_prompt(num_frames: int) -> str:
+def _build_prompt(num_frames: int, known_products: Optional[List[Dict]] = None) -> str:
     """
     Prompt that asks Gemini to analyse exactly `num_frames` images and return
     a strict JSON array — one element per frame, in order.
-    """
-    return f"""You are a product-detection assistant. You will be shown {num_frames} video frame(s) in order.
 
-For EACH frame identify every clearly visible PHYSICAL, PURCHASABLE product — things a viewer could actually buy (e.g. a camera, a desk lamp, a pair of shoes, a laptop, a food product, a water bottle, a piece of furniture).
+    `known_products` is an optional list of {name, brand} dicts accumulated from
+    previous batches. The model is asked to reuse those exact names/brands when
+    it detects the same item, preventing naming drift across batches.
+    """
+    known_section = ""
+    if known_products:
+        lines = []
+        for p in known_products:
+            brand_str = f" (brand: {p['brand']})" if p.get("brand") else " (brand unknown)"
+            lines.append(f"  - {p['name']}{brand_str}")
+        known_section = (
+            "\nPreviously detected products in this video — if you see the same item, "
+            "use EXACTLY these names and brands (do not invent variations):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    return f"""You are a product-detection assistant. You will be shown {num_frames} video frame(s) in order.
+{known_section}
+For EACH frame identify every clearly visible PHYSICAL, PURCHASABLE product that a viewer could actually buy.
+
+BE SPECIFIC — use the exact product name or model number if it is legible (e.g. "Sony WH-1000XM5" not "headphones", "IKEA POÄNG chair" not "chair", "Apple MacBook Pro 16-inch" not "laptop"). Only include a product if you are reasonably confident it is a specific, real, buyable item — not a vague object category.
 
 Return a JSON array of exactly {num_frames} objects — one per frame, same order as the images.
 Each object must follow this schema:
@@ -44,31 +63,37 @@ Each object must follow this schema:
 {{
   "items": [
     {{
-      "name": "specific product name or description",
+      "name": "specific product name or model number",
       "brand": "brand name if clearly legible, otherwise null",
       "category": "one of: clothing, electronics, food, beverage, vehicle, accessory, appliance, sporting goods, furniture, other",
-      "confidence": <float 0.0 to 1.0>,
+      "confidence": <float 0.0 to 1.0>
     }}
   ]
 }}
 
 Rules:
-- Only include PHYSICAL products that can be purchased.
-- EXCLUDE the following — do not include them under any circumstances:
-    • Software, apps, or app icons (e.g. YouTube app, iCloud icon, Mail icon, Launchpad)
-    • On-screen UI elements, operating system interfaces, or desktop widgets
-    • Videos, thumbnails, or other media content visible on a screen
-    • Websites, social media posts, or browser content
+- Only include items where BOTH the specific product name/model AND the brand are clearly identifiable. If either is missing or uncertain, skip the item entirely.
+- If nothing meets this bar, return {{"items": []}}.
+- EXCLUDE under any circumstances:
+    • Software, apps, or app icons
+    • OS/UI elements, desktop widgets, on-screen interfaces
+    • Videos, thumbnails, browser/web content visible on a screen
     • Digital services or subscriptions
     • People, faces, or text-only graphics
-- Set brand to null if the brand is not legible — do NOT omit the physical item.
-- If a frame has no identifiable physical products, return {{"items": []}}.
 - Do NOT wrap the array in any other key. Output raw JSON only."""
 
 
-def _analyze_batch(client: genai.Client, batch: List[Dict]) -> List[Dict]:
+def _analyze_batch(
+    client: genai.Client,
+    batch: List[Dict],
+    known_products: Optional[List[Dict]] = None,
+) -> List[Dict]:
     """
     Send one batch of frames to Gemini in a single API call.
+
+    `known_products` is a snapshot of all products detected in previous rounds;
+    passing it to the prompt prevents the model from naming the same item
+    differently across batches.
 
     Returns a list of per-frame result dicts aligned to the input batch:
       [{"timestamp", "frame_path", "products": [{"name", "brand",
@@ -77,7 +102,9 @@ def _analyze_batch(client: genai.Client, batch: List[Dict]) -> List[Dict]:
     num_frames = len(batch)
 
     # Build the content: text prompt first, then one image part per frame
-    parts: List[types.Part] = [types.Part.from_text(text=_build_prompt(num_frames))]
+    parts: List[types.Part] = [
+        types.Part.from_text(text=_build_prompt(num_frames, known_products))
+    ]
     for frame in batch:
         image_bytes = base64.b64decode(frame["frame_b64"])
         parts.append(
@@ -102,13 +129,14 @@ def _analyze_batch(client: genai.Client, batch: List[Dict]) -> List[Dict]:
 
         products = []
         for item in raw_items:
-            name = item.get("name", "").strip()
-            if not name:
+            name  = (item.get("name")  or "").strip()
+            brand = (item.get("brand") or "").strip()
+            # Both a specific name and a brand are required — skip vague/unbranded items
+            if not name or not brand:
                 continue
-            # brand may be null — merge.py will attempt to resolve it from the transcript
             products.append({
                 "name": name,
-                "brand": (item.get("brand") or "").strip() or None,
+                "brand": brand,
                 "category": item.get("category", "other"),
                 "confidence": item.get("confidence"),
             })
@@ -197,43 +225,80 @@ def analyze_frames(
     # Split frames into batches
     batches = [frames[i:i + batch_size] for i in range(0, len(frames), batch_size)]
     batch_offsets = list(range(0, len(frames), batch_size))
+    total_batches = len(batches)
 
     logger.info(
         "Starting frame analysis: %d frames → %d batches "
         "(batch_size=%d, workers=%d, model=%s)",
-        len(frames), len(batches), batch_size, max_workers, GEMINI_MODEL,
+        len(frames), total_batches, batch_size, max_workers, GEMINI_MODEL,
     )
 
     # Pre-allocate result slots so we can write results in original order
     per_frame_results: List[Optional[Dict]] = [None] * len(frames)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_analyze_batch, client, batch): (idx, offset)
-            for idx, (batch, offset) in enumerate(zip(batches, batch_offsets))
-        }
+    # Accumulated known products — passed as context to each subsequent round
+    # so the model reuses consistent names/brands across batches.
+    known_products: List[Dict] = []
+    known_products_keys: set = set()
 
-        for future in as_completed(future_map):
-            batch_idx, offset = future_map[future]
-            try:
-                batch_results = future.result()
-                for j, frame_result in enumerate(batch_results):
-                    per_frame_results[offset + j] = frame_result
-                logger.debug(
-                    "Batch %d/%d done (%d frames)",
-                    batch_idx + 1, len(batches), len(batch_results),
-                )
-            except Exception as e:
-                logger.error("Batch %d/%d failed: %s", batch_idx + 1, len(batches), e)
-                # Fill slots with empty results so indices stay correct
-                for j, frame in enumerate(batches[batch_idx]):
-                    if per_frame_results[offset + j] is None:
-                        per_frame_results[offset + j] = {
-                            "timestamp": frame["timestamp"],
-                            "frame_path": frame.get("frame_path", ""),
-                            "products": [],
-                            "error": str(e),
-                        }
+    # Process in rounds of max_workers batches each.
+    # After every round, collect newly detected products and add them to
+    # known_products so the next round can reference them.
+    for round_start in range(0, total_batches, max_workers):
+        round_batches = batches[round_start : round_start + max_workers]
+        round_offsets = batch_offsets[round_start : round_start + max_workers]
+        round_end = min(round_start + max_workers, total_batches)
+
+        logger.debug(
+            "Round %d–%d / %d batches (known_products context: %d items)",
+            round_start + 1, round_end, total_batches, len(known_products),
+        )
+
+        # Take a stable snapshot of known_products for all batches in this round
+        known_snapshot = list(known_products)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _analyze_batch, client, batch, known_snapshot
+                ): (round_start + idx, offset)
+                for idx, (batch, offset) in enumerate(zip(round_batches, round_offsets))
+            }
+
+            for future in as_completed(future_map):
+                batch_idx, offset = future_map[future]
+                try:
+                    batch_results = future.result()
+                    for j, frame_result in enumerate(batch_results):
+                        per_frame_results[offset + j] = frame_result
+                    logger.debug(
+                        "Batch %d/%d done (%d frames)",
+                        batch_idx + 1, total_batches, len(batch_results),
+                    )
+                except Exception as e:
+                    logger.error("Batch %d/%d failed: %s", batch_idx + 1, total_batches, e)
+                    for j, frame in enumerate(batches[batch_idx]):
+                        if per_frame_results[offset + j] is None:
+                            per_frame_results[offset + j] = {
+                                "timestamp": frame["timestamp"],
+                                "frame_path": frame.get("frame_path", ""),
+                                "products": [],
+                                "error": str(e),
+                            }
+
+        # After this round completes, accumulate any new products for next round
+        for slot in per_frame_results:
+            if slot is None:
+                continue
+            for product in slot.get("products", []):
+                name = (product.get("name") or "").strip()
+                brand = (product.get("brand") or "").strip()
+                if not name:
+                    continue
+                key = f"{name.lower()}|{brand.lower()}"
+                if key not in known_products_keys:
+                    known_products_keys.add(key)
+                    known_products.append({"name": name, "brand": brand or None})
 
     per_frame_raw = [r for r in per_frame_results if r is not None]
 
@@ -289,7 +354,9 @@ def _build_video_prompt(interval_seconds: float) -> str:
     """
     return f"""You are a product-detection assistant analyzing a video.
 
-Sample the video at every {interval_seconds:.1f} second(s) and identify every clearly visible PHYSICAL, PURCHASABLE product at each sample point — things a viewer could actually buy (e.g. a camera, a desk lamp, a pair of shoes, a laptop, a food product, a water bottle, a piece of furniture).
+Sample the video at every {interval_seconds:.1f} second(s) and identify every clearly visible PHYSICAL, PURCHASABLE product at each sample point.
+
+BE SPECIFIC — use the exact product name or model number if it is legible (e.g. "Sony WH-1000XM5" not "headphones", "Samsung 65-inch QLED TV" not "TV", "Nike Air Max 90" not "shoes"). Only include a product if you are reasonably confident it is a specific, real, buyable item — not a vague object category. Use consistent names throughout the entire video; if you see the same product at multiple points, use the exact same name and brand each time.
 
 Return a JSON array where each element represents one sample point:
 
@@ -298,11 +365,10 @@ Return a JSON array where each element represents one sample point:
     "timestamp": <seconds as a float>,
     "items": [
       {{
-        "name": "specific product name or description",
+        "name": "specific product name or model number",
         "brand": "brand name if clearly legible, otherwise null",
         "category": "one of: clothing, electronics, food, beverage, vehicle, accessory, appliance, sporting goods, furniture, other",
-        "timestamp": "the time in seconds when it first appears or is mentioned",
-        "confidence": "0.0 to 1.0",
+        "confidence": <float 0.0 to 1.0>
       }}
     ]
   }}
@@ -310,15 +376,13 @@ Return a JSON array where each element represents one sample point:
 
 Rules:
 - Include an entry for every sample point, even if items is [].
-- Only include PHYSICAL products that can be purchased.
-- EXCLUDE the following — do not include them under any circumstances:
-    • Software, apps, or app icons (e.g. YouTube app, iCloud icon, Mail icon, Launchpad)
-    • On-screen UI elements, operating system interfaces, or desktop widgets
-    • Videos, thumbnails, or other media content visible on a screen
-    • Websites, social media posts, or browser content
+- Only include items where BOTH the specific product name/model AND the brand are clearly identifiable. If either is missing or uncertain, skip the item entirely.
+- EXCLUDE under any circumstances:
+    • Software, apps, or app icons
+    • OS/UI elements, desktop widgets, on-screen interfaces
+    • Videos, thumbnails, browser/web content visible on a screen
     • Digital services or subscriptions
     • People, faces, or text-only graphics
-- Set brand to null if the brand is not legible — do NOT omit the physical item.
 - Output raw JSON only — no markdown, no extra keys."""
 
 
@@ -411,13 +475,14 @@ def analyze_youtube_url(
 
         products = []
         for item in raw_items:
-            name = item.get("name", "").strip()
-            if not name:
+            name  = (item.get("name")  or "").strip()
+            brand = (item.get("brand") or "").strip()
+            # Both a specific name and a brand are required — skip vague/unbranded items
+            if not name or not brand:
                 continue
-            # brand may be null — merge.py will attempt to resolve it from the transcript
             products.append({
                 "name": name,
-                "brand": (item.get("brand") or "").strip() or None,
+                "brand": brand,
                 "category": item.get("category", "other"),
                 "confidence": item.get("confidence"),
             })

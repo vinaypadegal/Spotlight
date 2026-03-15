@@ -58,6 +58,7 @@ Detection windowing rules
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
@@ -67,6 +68,9 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+DETECTIONS_DIR = "data/detections"
+os.makedirs(DETECTIONS_DIR, exist_ok=True)
 
 # Default duration to extend a detection window past a frame timestamp.
 DETECTION_WINDOW_S: float = 5.0
@@ -443,7 +447,7 @@ def merge(
         len(detections), unique_products, transcript_only_count, brand_resolved_count,
     )
 
-    return {
+    result = {
         "video_id":   video_id,
         "title":      title,
         "duration":   duration,
@@ -455,6 +459,18 @@ def merge(
             "brand_resolved_count": brand_resolved_count,
         },
     }
+
+    # --- Persist to data/detections/<video_id>.json ---
+    if video_id:
+        detections_path = Path(DETECTIONS_DIR) / f"{video_id}.json"
+        try:
+            with open(detections_path, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, ensure_ascii=False, indent=2)
+            logger.info("Detections saved to '%s'", detections_path)
+        except Exception as e:
+            logger.error("Failed to save detections file '%s': %s", detections_path, e)
+
+    return result
 
 
 def enrich_thumbnails(result: Dict, api_key: Optional[str] = None) -> Dict:

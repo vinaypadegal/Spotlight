@@ -351,7 +351,6 @@ def merge(
     # Step 3: Enrich registry with transcript mentions
     # -------------------------------------------------------------------
     brand_resolved_count = 0
-    transcript_only_count = 0
 
     for mention in transcript_mentions:
         m_name  = (mention.get("name")  or "").strip()
@@ -366,7 +365,8 @@ def merge(
         if matched_key:
             entry = registry[matched_key]
 
-            # Resolve missing brand from transcript
+            # Resolve missing brand from transcript — only if transcript also
+            # has a concrete brand; don't overwrite with an empty string.
             if not entry["brand"] and m_brand:
                 old_key = matched_key
                 new_key = f"{entry['name'].lower()}|{m_brand.lower()}"
@@ -380,17 +380,11 @@ def merge(
                     registry[new_key] = entry
                     del registry[old_key]
         else:
-            # Product mentioned in transcript but never detected visually
-            key = f"{m_name.lower()}|{m_brand.lower()}"
-            if key not in registry:
-                registry[key] = {
-                    "name":            m_name,
-                    "brand":           m_brand or None,
-                    "category":        "other",
-                    "confidence":      None,
-                    "_raw_timestamps": [m_ts],
-                }
-                transcript_only_count += 1
+            # Product mentioned in transcript but never visually detected —
+            # skip entirely. We only surface products the model actually saw.
+            logger.debug(
+                "Ignoring transcript-only mention '%s' (not seen visually).", m_name
+            )
 
     # -------------------------------------------------------------------
     # Step 4: Flatten into a sorted list of individual detection events.
@@ -400,6 +394,19 @@ def merge(
     # IDs are assigned after sorting by show_at.
     # -------------------------------------------------------------------
     flat: List[Dict] = []
+
+    # Belt-and-suspenders: drop any registry entry that still has no brand.
+    # This can happen if vision refinement fell back to raw results (e.g. after
+    # a 503) or a transcript mention snuck through without a resolved brand.
+    brandless = [k for k, v in registry.items() if not (v.get("brand") or "").strip()]
+    if brandless:
+        logger.debug(
+            "Dropping %d brand-less product(s) before flattening: %s",
+            len(brandless),
+            [registry[k]["name"] for k in brandless],
+        )
+        for k in brandless:
+            del registry[k]
 
     for entry in registry.values():
         raw_ts  = entry.pop("_raw_timestamps", [])
@@ -445,8 +452,8 @@ def merge(
 
     logger.info(
         "Merge complete — %d detections across %d products "
-        "(%d transcript-only, %d brands resolved from transcript)",
-        len(detections), unique_products, transcript_only_count, brand_resolved_count,
+        "(%d brands resolved from transcript)",
+        len(detections), unique_products, brand_resolved_count,
     )
 
     result = {

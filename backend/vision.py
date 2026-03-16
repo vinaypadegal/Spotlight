@@ -2,9 +2,13 @@ import base64
 import json
 import logging
 import os
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TypeVar
+
+T = TypeVar("T")
 
 from google import genai
 from google.genai import types
@@ -14,7 +18,10 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------------
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL          = os.environ.get("GEMINI_MODEL",          "gemini-2.5-flash")
+# Fallback model used when the primary is unavailable (503/429).
+# A lighter/different model is less likely to be overloaded at the same time.
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash")
 
 # How many frames to pack into one API call.
 # Gemini's context window is large, but 10 images per call is a sweet spot
@@ -23,6 +30,106 @@ BATCH_SIZE = 10
 
 # How many API calls to run in parallel.
 MAX_WORKERS = 4
+
+# Retry configuration for transient Gemini errors (503, 429).
+MAX_RETRIES   = 4      # up to 5 total attempts on the PRIMARY model
+RETRY_BASE_S  = 5.0   # initial wait (seconds)
+RETRY_BACKOFF = 2.0   # multiplier per attempt  →  5 → 10 → 20 → 40 s
+RETRY_JITTER  = 2.0   # max random jitter added to each wait
+
+
+# -------------------------------------------------------------------------
+# Retry helper
+# -------------------------------------------------------------------------
+
+def _is_transient(exc: Exception) -> bool:
+    """Return True for errors that are worth retrying (overload / rate-limit)."""
+    s = str(exc)
+    return any(tok in s for tok in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+
+
+def _call_with_retry(
+    fn: Callable[[], T],
+    fallback_fn: Optional[Callable[[], T]] = None,
+    label: str = "Gemini call",
+) -> T:
+    """
+    Call `fn()` with exponential back-off retries for transient errors.
+
+    Retry schedule (primary model):
+        attempt 1 → wait  5 s (+jitter)
+        attempt 2 → wait 10 s (+jitter)
+        attempt 3 → wait 20 s (+jitter)
+        attempt 4 → wait 40 s (+jitter)
+        attempt 5 → give up on primary
+
+    If `fallback_fn` is provided and the primary model exhausts all retries
+    with a transient error, the fallback is tried once (also with its own
+    retry cycle at a shorter schedule).
+
+    Non-transient errors (auth failures, bad requests, …) raise immediately.
+    """
+    last_exc: Optional[Exception] = None
+    delay = RETRY_BASE_S
+
+    # ── Primary model ─────────────────────────────────────────────────────────
+    for attempt in range(1, MAX_RETRIES + 2):   # attempts 1 … MAX_RETRIES+1
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_transient(exc):
+                raise   # don't retry auth errors, invalid requests, etc.
+
+            last_exc = exc
+            if attempt > MAX_RETRIES:
+                break   # fall through to fallback
+
+            jitter    = random.uniform(0, RETRY_JITTER)
+            wait_time = delay + jitter
+            logger.warning(
+                "%s — transient error on attempt %d/%d (%s). "
+                "Retrying in %.1f s...",
+                label, attempt, MAX_RETRIES + 1, exc, wait_time,
+            )
+            time.sleep(wait_time)
+            delay *= RETRY_BACKOFF
+
+    # ── Fallback model ─────────────────────────────────────────────────────────
+    if fallback_fn is not None:
+        logger.warning(
+            "%s — primary model failed after %d attempts; "
+            "switching to fallback model (%s).",
+            label, MAX_RETRIES + 1, GEMINI_FALLBACK_MODEL,
+        )
+        fb_delay = RETRY_BASE_S
+        for fb_attempt in range(1, MAX_RETRIES + 2):
+            try:
+                return fallback_fn()
+            except Exception as exc:
+                if not _is_transient(exc):
+                    raise
+
+                last_exc = exc
+                if fb_attempt > MAX_RETRIES:
+                    break
+
+                jitter    = random.uniform(0, RETRY_JITTER)
+                wait_time = fb_delay + jitter
+                logger.warning(
+                    "%s [fallback] — transient error on attempt %d/%d (%s). "
+                    "Retrying in %.1f s...",
+                    label, fb_attempt, MAX_RETRIES + 1, exc, wait_time,
+                )
+                time.sleep(wait_time)
+                fb_delay *= RETRY_BACKOFF
+
+        logger.error(
+            "%s — fallback model also failed after %d attempts.",
+            label, MAX_RETRIES + 1,
+        )
+
+    assert last_exc is not None
+    raise last_exc
 
 
 # -------------------------------------------------------------------------
@@ -111,12 +218,17 @@ def _analyze_batch(
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
         )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[types.Content(parts=parts, role="user")],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
+    _contents = [types.Content(parts=parts, role="user")]
+    _cfg      = types.GenerateContentConfig(response_mime_type="application/json")
+
+    response = _call_with_retry(
+        fn=lambda: client.models.generate_content(
+            model=GEMINI_MODEL, contents=_contents, config=_cfg,
         ),
+        fallback_fn=lambda: client.models.generate_content(
+            model=GEMINI_FALLBACK_MODEL, contents=_contents, config=_cfg,
+        ),
+        label=f"_analyze_batch ({len(batch)} frames)",
     )
 
     frame_array = json.loads(response.text.strip())
@@ -148,6 +260,199 @@ def _analyze_batch(
         })
 
     return results
+
+
+# -------------------------------------------------------------------------
+# Post-processing: Gemini-powered refinement
+# -------------------------------------------------------------------------
+
+def _build_refinement_prompt(products: List[Dict]) -> str:
+    """
+    Prompt that asks Gemini to clean up a flat product list extracted from
+    multiple frames:
+      1. Remove any entry that is too vague or generic to be shoppable.
+      2. Consolidate near-duplicate names/brands into a single canonical entry.
+
+    Input products are indexed by "id" so the response can be mapped back
+    to the original detections.
+    """
+    product_list_json = json.dumps(products, indent=2)
+    return f"""You are a product data quality assistant.
+
+Below is a list of products detected across multiple frames of a video. Each entry has an "id", "name", "brand", and "category".
+
+{product_list_json}
+
+Your tasks:
+
+1. REMOVE any product that is too vague or generic to be clearly shoppable on Google Shopping.
+   Examples of entries to REMOVE:
+     - "laptop" (not a product name — just a category)
+     - "headphones" with brand "Unknown"
+     - "chair" (no model number, no clear brand)
+     - Any product where you cannot imagine a precise Google Shopping search that would find it.
+   Keep only products with a specific, searchable model name or product title AND a real, known brand.
+
+2. CONSOLIDATE: if multiple entries clearly refer to the same physical product — even if their
+   names are slightly different (e.g., "Sony WH-1000XM5 Wireless Headphones" and "Sony WH1000XM5",
+   or "Apple MacBook Pro 16 inch" and "MacBook Pro 16-inch (Apple)") — group them together.
+   Choose the single most accurate, specific, and easily shoppable name and brand for the group.
+
+Return a JSON array. Each element represents one canonical product:
+
+{{
+  "ids": [<list of integer ids from the input that belong to this product>],
+  "name": "<the best, most specific product name — exact model number/title if known>",
+  "brand": "<brand name>",
+  "category": "<one of: clothing, electronics, food, beverage, vehicle, accessory, appliance, sporting goods, furniture, other>"
+}}
+
+Rules:
+- Every input id must appear in exactly one output entry, OR be omitted entirely (meaning it was removed as too vague).
+- Do NOT invent or fabricate details you are not confident about.
+- If only one entry exists and it is specific enough, return an array with that single entry.
+- Output raw JSON only — no markdown, no extra prose."""
+
+
+def _refine_detections(frames_out: List[Dict], client: genai.Client) -> List[Dict]:
+    """
+    Post-processing pass that calls Gemini once on the full set of unique
+    products gathered across all frames.
+
+    Two things happen in this single API call:
+      (a) Vague / non-shoppable products are dropped (e.g., "headphones" with
+          no model, "a chair" with no brand).
+      (b) Near-duplicate names caused by batch naming drift are consolidated
+          into a single canonical (name, brand) pair — the most accurate and
+          searchable one in the group.
+
+    The canonical names are then written back into every frame, and products
+    that were removed are stripped out.
+
+    Falls back gracefully to the original frames if the API call fails.
+    """
+    # ── 1. Collect all unique (name, brand) pairs and assign stable integer IDs
+    raw_key_to_id: Dict[str, int] = {}
+    id_to_entry: Dict[int, Dict] = {}
+    next_id = 0
+
+    for frame in frames_out:
+        for p in frame.get("products", []):
+            name  = (p.get("name")  or "").strip()
+            brand = (p.get("brand") or "").strip()
+            if not name:
+                continue
+            key = f"{name.lower()}|{brand.lower()}"
+            if key not in raw_key_to_id:
+                raw_key_to_id[key] = next_id
+                id_to_entry[next_id] = {
+                    "id":       next_id,
+                    "name":     name,
+                    "brand":    brand,
+                    "category": p.get("category", "other"),
+                }
+                next_id += 1
+
+    if not id_to_entry:
+        logger.debug("Refinement skipped — no products detected.")
+        return frames_out
+
+    logger.info(
+        "Refining %d unique product(s) — removing vague entries and "
+        "consolidating near-duplicates via Gemini...",
+        len(id_to_entry),
+    )
+
+    # ── 2. Single Gemini call for the full product list ───────────────────────
+    product_list = list(id_to_entry.values())
+    _ref_contents = [
+        types.Content(
+            parts=[types.Part.from_text(text=_build_refinement_prompt(product_list))],
+            role="user",
+        )
+    ]
+    _ref_cfg = types.GenerateContentConfig(response_mime_type="application/json")
+
+    try:
+        response = _call_with_retry(
+            fn=lambda: client.models.generate_content(
+                model=GEMINI_MODEL, contents=_ref_contents, config=_ref_cfg,
+            ),
+            fallback_fn=lambda: client.models.generate_content(
+                model=GEMINI_FALLBACK_MODEL, contents=_ref_contents, config=_ref_cfg,
+            ),
+            label="refine_detections",
+        )
+        canonical_groups = json.loads(response.text.strip())
+    except Exception as exc:
+        logger.error(
+            "Refinement API call failed (%s) — keeping raw detections.", exc
+        )
+        return frames_out
+
+    # ── 3. Build id → canonical mapping; IDs absent from output were removed ──
+    id_to_canonical: Dict[int, Dict] = {}
+
+    for group in canonical_groups:
+        canonical_name  = (group.get("name")  or "").strip()
+        canonical_brand = (group.get("brand") or "").strip()
+        if not canonical_name or not canonical_brand:
+            # Model returned an incomplete group — treat as removed
+            continue
+        canonical_entry = {
+            "name":     canonical_name,
+            "brand":    canonical_brand,
+            "category": group.get("category", "other"),
+        }
+        for gid in group.get("ids", []):
+            try:
+                id_to_canonical[int(gid)] = canonical_entry
+            except (ValueError, TypeError):
+                pass
+
+    kept    = len({v["name"] + "|" + v["brand"] for v in id_to_canonical.values()})
+    removed = len(id_to_entry) - len(id_to_canonical)
+    logger.info(
+        "Refinement complete — %d canonical product(s) kept, %d removed.",
+        kept, removed,
+    )
+    if removed > 0:
+        removed_names = [
+            id_to_entry[i]["name"]
+            for i in id_to_entry
+            if i not in id_to_canonical
+        ]
+        logger.debug("Removed products: %s", removed_names)
+
+    # ── 4. Rewrite every frame's product list with canonical names ─────────────
+    new_frames: List[Dict] = []
+    for frame in frames_out:
+        seen_in_frame: set = set()
+        new_products: List[Dict] = []
+
+        for p in frame.get("products", []):
+            name  = (p.get("name")  or "").strip()
+            brand = (p.get("brand") or "").strip()
+            if not name:
+                continue
+            raw_id   = raw_key_to_id.get(f"{name.lower()}|{brand.lower()}")
+            canonical = id_to_canonical.get(raw_id) if raw_id is not None else None
+            if canonical is None:
+                continue  # product was removed in the refinement step
+
+            c_key = f"{canonical['name'].lower()}|{canonical['brand'].lower()}"
+            if c_key not in seen_in_frame:
+                seen_in_frame.add(c_key)
+                new_products.append({
+                    "name":       canonical["name"],
+                    "brand":      canonical["brand"],
+                    "category":   canonical["category"],
+                    "confidence": p.get("confidence"),  # keep original confidence
+                })
+
+        new_frames.append({**frame, "products": new_products})
+
+    return new_frames
 
 
 # -------------------------------------------------------------------------
@@ -302,12 +607,9 @@ def analyze_frames(
 
     per_frame_raw = [r for r in per_frame_results if r is not None]
 
-    # Build the per-frame output, deduplicating products within each frame
-    # by normalised name + brand (guards against the model repeating an item).
+    # Deduplicate products within each frame (guards against the model
+    # repeating the same item inside a single batch response).
     frames_out: List[Dict] = []
-    global_seen: set = set()
-    global_unique_count = 0
-
     for frame in per_frame_raw:
         frame_seen: set = set()
         unique_frame_products: List[Dict] = []
@@ -316,17 +618,23 @@ def analyze_frames(
             if key not in frame_seen:
                 frame_seen.add(key)
                 unique_frame_products.append(product)
-            if key not in global_seen:
-                global_seen.add(key)
-                global_unique_count += 1
-
         frames_out.append({
             "timestamp": frame["timestamp"],
             "frame_path": frame.get("frame_path", ""),
             "products": unique_frame_products,
         })
 
+    # Refinement pass — single Gemini call that:
+    #   (a) drops vague / non-shoppable entries, and
+    #   (b) consolidates near-duplicate names from different batches into
+    #       one canonical (name, brand) pair.
+    frames_out = _refine_detections(frames_out, client)
+
     frames_with_detections = sum(1 for f in frames_out if f["products"])
+    global_unique_count = len({
+        f"{p['name'].lower()}|{(p.get('brand') or '').lower()}"
+        for f in frames_out for p in f["products"]
+    })
 
     logger.info(
         "Analysis complete — %d frames (%d with detections), %d unique products total",
@@ -455,13 +763,17 @@ def analyze_youtube_url(
         )
     ]
 
+    _yt_cfg = types.GenerateContentConfig(response_mime_type="application/json")
+
     logger.debug("Sending request to Gemini (model=%s)...", GEMINI_MODEL)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
+    response = _call_with_retry(
+        fn=lambda: client.models.generate_content(
+            model=GEMINI_MODEL, contents=contents, config=_yt_cfg,
         ),
+        fallback_fn=lambda: client.models.generate_content(
+            model=GEMINI_FALLBACK_MODEL, contents=contents, config=_yt_cfg,
+        ),
+        label="analyze_youtube_url",
     )
     logger.debug("Response received from Gemini")
 
@@ -496,11 +808,8 @@ def analyze_youtube_url(
     # Sort by timestamp in case the model returned them out of order
     per_frame.sort(key=lambda x: x["timestamp"])
 
-    # Build the per-frame output, deduplicating products within each frame
+    # Deduplicate products within each frame
     frames_out: List[Dict] = []
-    global_seen: set = set()
-    global_unique_count = 0
-
     for frame in per_frame:
         frame_seen: set = set()
         unique_frame_products: List[Dict] = []
@@ -509,17 +818,20 @@ def analyze_youtube_url(
             if key not in frame_seen:
                 frame_seen.add(key)
                 unique_frame_products.append(product)
-            if key not in global_seen:
-                global_seen.add(key)
-                global_unique_count += 1
-
         frames_out.append({
             "timestamp": frame["timestamp"],
             "frame_path": frame.get("frame_path"),   # None for direct URL analysis
             "products": unique_frame_products,
         })
 
+    # Refinement pass — drops vague entries and consolidates near-duplicate names
+    frames_out = _refine_detections(frames_out, client)
+
     frames_with_detections = sum(1 for f in frames_out if f["products"])
+    global_unique_count = len({
+        f"{p['name'].lower()}|{(p.get('brand') or '').lower()}"
+        for f in frames_out for p in f["products"]
+    })
 
     logger.info(
         "Direct analysis complete — %d samples (%d with detections), %d unique products total",

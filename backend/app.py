@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import os
+import json
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ from ingest import (
     extract_video_id,
     download_video,
     VIDEOS_DIR,
+    TRANSCRIPTS_DIR,
 )
 from frames import extract_frames
 from vision import analyze_frames, analyze_youtube_url
@@ -435,58 +437,129 @@ async def run_pipeline(request_body: PipelineRequest):
 
     # ------------------------------------------------------------------
     # Step 1: Download video + fetch metadata (title, duration)
+    #   Skip if the video file is already on disk — saves bandwidth and
+    #   time on re-runs.  We still call get_video_info() to obtain the
+    #   title / duration without triggering a full download.
     # ------------------------------------------------------------------
     video_title: Optional[str] = None
     video_duration: Optional[float] = None
+    video_path = str(Path(VIDEOS_DIR) / f"{video_id}.mp4")
 
-    try:
-        logger.info("[1/5] Downloading video...")
-        download_result = download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
-        video_title    = download_result.get("title")
-        video_duration = download_result.get("duration")
+    if Path(video_path).exists():
+        logger.info(
+            "[1/5] Video already on disk, skipping download → %s", video_path
+        )
+        try:
+            info = get_video_info(video_url)
+            video_title    = info.get("title")
+            video_duration = info.get("duration")
+        except Exception as meta_err:
+            logger.warning("[1/5] Could not fetch video metadata: %s", meta_err)
+
         steps["download"] = {
-            "status":     "done",
-            "video_path": download_result.get("file_path"),
+            "status":     "skipped",
+            "reason":     "Video file already exists on disk",
+            "video_path": video_path,
             "title":      video_title,
             "duration":   video_duration,
         }
-        logger.info(
-            "[1/5] Download complete → %s (title='%s', duration=%ss)",
-            download_result.get("file_path"), video_title, video_duration,
+        logger.debug(
+            "[1/5] Metadata — title=%r  duration=%ss",
+            video_title, video_duration,
         )
-    except Exception as e:
-        logger.error("[1/5] Download failed: %s", e)
-        steps["download"] = {"status": "failed", "error": str(e)}
-        raise HTTPException(
-            status_code=500,
-            detail=f"Pipeline failed at download step: {e}",
-        )
-
-    video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
+    else:
+        try:
+            logger.info("[1/5] Downloading video...")
+            download_result = download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
+            video_title    = download_result.get("title")
+            video_duration = download_result.get("duration")
+            steps["download"] = {
+                "status":     "done",
+                "video_path": download_result.get("file_path"),
+                "title":      video_title,
+                "duration":   video_duration,
+            }
+            logger.info(
+                "[1/5] Download complete → %s (title=%r, duration=%ss)",
+                download_result.get("file_path"), video_title, video_duration,
+            )
+            logger.debug("[1/5] Full download result:\n%s", json.dumps(download_result, indent=2, default=str))
+        except Exception as e:
+            logger.error("[1/5] Download failed: %s", e)
+            steps["download"] = {"status": "failed", "error": str(e)}
+            raise HTTPException(
+                status_code=500,
+                detail=f"Pipeline failed at download step: {e}",
+            )
 
     # ------------------------------------------------------------------
     # Step 2: Transcript
+    #   Skip if the transcript JSON file is already saved to disk — load
+    #   directly from file instead of hitting the YouTube API again.
     # ------------------------------------------------------------------
     transcript_data = None
-    try:
-        logger.info("[2/5] Fetching transcript...")
-        transcript_data = get_transcript(video_id)
-        steps["transcript"] = {
-            "status": "done",
-            "language": transcript_data.get("language"),
-            "word_count": transcript_data.get("word_count"),
-            "is_generated": transcript_data.get("is_generated"),
-            "saved_to": f"transcripts/{video_id}.json",
-        }
-        logger.info(
-            "[2/5] Transcript done — %d words (%s)",
-            transcript_data.get("word_count", 0),
-            "auto-generated" if transcript_data.get("is_generated") else "manual",
-        )
-    except Exception as e:
-        # Transcript is optional — log a warning and continue
-        logger.warning("[2/5] Transcript unavailable, skipping: %s", e)
-        steps["transcript"] = {"status": "skipped", "reason": str(e)}
+    transcript_file = Path(TRANSCRIPTS_DIR) / f"{video_id}.json"
+
+    if transcript_file.exists():
+        try:
+            transcript_data = json.loads(transcript_file.read_text(encoding="utf-8"))
+            steps["transcript"] = {
+                "status":       "skipped",
+                "reason":       "Loaded from cached file on disk",
+                "language":     transcript_data.get("language"),
+                "word_count":   transcript_data.get("word_count"),
+                "is_generated": transcript_data.get("is_generated"),
+                "loaded_from":  str(transcript_file),
+            }
+            logger.info(
+                "[2/5] Transcript already on disk, loaded → %s  (%d words, %s)",
+                transcript_file,
+                transcript_data.get("word_count", 0),
+                "auto-generated" if transcript_data.get("is_generated") else "manual",
+            )
+            # Log first few segments so the user can inspect quality
+            segments = transcript_data.get("transcript", [])
+            if segments:
+                preview = segments[:5]
+                logger.debug(
+                    "[2/5] Transcript preview (first %d/%d segments):\n%s",
+                    len(preview), len(segments),
+                    json.dumps(preview, indent=2, ensure_ascii=False),
+                )
+        except Exception as load_err:
+            logger.warning(
+                "[2/5] Failed to load cached transcript (%s), re-fetching...", load_err
+            )
+            transcript_data = None  # fall through to re-fetch below
+
+    if transcript_data is None:
+        try:
+            logger.info("[2/5] Fetching transcript from YouTube...")
+            transcript_data = get_transcript(video_id)
+            steps["transcript"] = {
+                "status":       "done",
+                "language":     transcript_data.get("language"),
+                "word_count":   transcript_data.get("word_count"),
+                "is_generated": transcript_data.get("is_generated"),
+                "saved_to":     str(transcript_file),
+            }
+            logger.info(
+                "[2/5] Transcript fetched — %d words (%s)",
+                transcript_data.get("word_count", 0),
+                "auto-generated" if transcript_data.get("is_generated") else "manual",
+            )
+            segments = transcript_data.get("transcript", [])
+            if segments:
+                preview = segments[:5]
+                logger.debug(
+                    "[2/5] Transcript preview (first %d/%d segments):\n%s",
+                    len(preview), len(segments),
+                    json.dumps(preview, indent=2, ensure_ascii=False),
+                )
+        except Exception as e:
+            # Transcript is optional — log a warning and continue
+            logger.warning("[2/5] Transcript unavailable, skipping: %s", e)
+            steps["transcript"] = {"status": "skipped", "reason": str(e)}
 
     # ------------------------------------------------------------------
     # Step 3: Frame extraction
@@ -500,12 +573,19 @@ async def run_pipeline(request_body: PipelineRequest):
             interval_seconds=interval,
         )
         steps["frames"] = {
-            "status": "done",
-            "frame_count": len(frames),
+            "status":           "done",
+            "frame_count":      len(frames),
             "interval_seconds": interval,
-            "saved_to": f"frames/{video_id}/",
+            "saved_to":         f"frames/{video_id}/",
         }
         logger.info("[3/5] Frame extraction done — %d frames", len(frames))
+        if frames:
+            preview_ts = [f["timestamp"] for f in frames[:10]]
+            logger.debug(
+                "[3/5] First %d timestamps: %s%s",
+                len(preview_ts), preview_ts,
+                " …" if len(frames) > 10 else "",
+            )
     except Exception as e:
         logger.error("[3/5] Frame extraction failed: %s", e)
         steps["frames"] = {"status": "failed", "error": str(e)}
@@ -523,14 +603,53 @@ async def run_pipeline(request_body: PipelineRequest):
         vision_result = analyze_frames(frames)
         summary = vision_result.get("summary", {})
         steps["vision"] = {
-            "status": "done",
-            "frame_count": summary.get("total_frames", 0),
+            "status":                 "done",
+            "frame_count":            summary.get("total_frames", 0),
             "frames_with_detections": summary.get("frames_with_detections", 0),
-            "unique_product_count": summary.get("unique_product_count", 0),
+            "unique_product_count":   summary.get("unique_product_count", 0),
         }
         logger.info(
-            "[4/5] Vision done — %d unique products detected",
+            "[4/5] Vision done — %d unique products across %d/%d frames",
             summary.get("unique_product_count", 0),
+            summary.get("frames_with_detections", 0),
+            summary.get("total_frames", 0),
+        )
+
+        # Log the unique product list so the user can see what was detected
+        unique_products = vision_result.get("unique_products", [])
+        if unique_products:
+            logger.info(
+                "[4/5] Unique products detected (%d):\n%s",
+                len(unique_products),
+                "\n".join(
+                    f"  • {p.get('brand', '?')} — {p.get('name', '?')}  "
+                    f"(conf={p.get('confidence', '?')}, cat={p.get('category', '?')})"
+                    for p in unique_products
+                ),
+            )
+        else:
+            logger.info("[4/5] No products detected in this video.")
+
+        # Full per-frame breakdown at DEBUG level
+        vision_frames = vision_result.get("frames", [])
+        frames_with_hits = [f for f in vision_frames if f.get("products")]
+        logger.debug(
+            "[4/5] Per-frame detections (%d frames with products):\n%s",
+            len(frames_with_hits),
+            json.dumps(
+                [
+                    {
+                        "timestamp": f["timestamp"],
+                        "products": [
+                            {"name": p.get("name"), "brand": p.get("brand"),
+                             "confidence": p.get("confidence")}
+                            for p in f["products"]
+                        ],
+                    }
+                    for f in frames_with_hits
+                ],
+                indent=2,
+            ),
         )
     except Exception as e:
         logger.error("[4/5] Vision analysis failed: %s", e)
@@ -555,9 +674,9 @@ async def run_pipeline(request_body: PipelineRequest):
         )
         merge_summary = merge_result.get("summary", {})
         steps["integration"] = {
-            "status": "done",
-            "total_products": merge_summary.get("total_products", 0),
-            "total_detections": merge_summary.get("total_detections", 0),
+            "status":               "done",
+            "total_products":       merge_summary.get("total_products", 0),
+            "total_detections":     merge_summary.get("total_detections", 0),
             "brand_resolved_count": merge_summary.get("brand_resolved_count", 0),
         }
         logger.info(
@@ -565,6 +684,27 @@ async def run_pipeline(request_body: PipelineRequest):
             merge_summary.get("total_products", 0),
             merge_summary.get("total_detections", 0),
             merge_summary.get("brand_resolved_count", 0),
+        )
+
+        # Log the final detections list so the user can inspect the output
+        final_detections = merge_result.get("detections", [])
+        if final_detections:
+            logger.info(
+                "[5/5] Final detections (%d):\n%s",
+                len(final_detections),
+                "\n".join(
+                    f"  [{d.get('show_at', '?'):.1f}s → {d.get('hide_at', '?'):.1f}s] "
+                    f"{d.get('brand', '?')} — {d.get('name', '?')}  "
+                    f"(conf={d.get('confidence', '?')}, src={d.get('source', '?')})"
+                    for d in final_detections
+                ),
+            )
+        else:
+            logger.info("[5/5] No detections in merged output.")
+
+        logger.debug(
+            "[5/5] Full merged result:\n%s",
+            json.dumps(merge_result, indent=2, default=str),
         )
     except Exception as e:
         logger.error("[5/5] Merge step failed: %s", e)
@@ -606,7 +746,6 @@ async def get_cached_detections(video_id: str):
     Serve cached detection results from data/detections/<video_id>.json.
     Returns 404 if the pipeline has not been run for this video yet.
     """
-    import json as _json
     detections_path = Path(__file__).parent.parent / "data" / "detections" / f"{video_id}.json"
     if not detections_path.exists():
         raise HTTPException(
@@ -614,7 +753,7 @@ async def get_cached_detections(video_id: str):
             detail=f"No cached detections found for '{video_id}'. Run the pipeline first.",
         )
     with open(detections_path, "r", encoding="utf-8") as fh:
-        data = _json.load(fh)
+        data = json.load(fh)
     return {"success": True, "data": data}
 
 

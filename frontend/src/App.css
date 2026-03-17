@@ -1,5 +1,7 @@
+@charset "UTF-8";
+
 /* ============================================================
-   YouTube Dark-Mode Clone — Spotlight
+   YouTube Dark-Mode Clone - Spotlight
    ============================================================ */
 
 :root {
@@ -211,7 +213,7 @@
 }
 .yt-main.sidebar-open      { margin-left: var(--yt-sidebar-w); }
 .yt-main.sidebar-collapsed { margin-left: var(--yt-sidebar-mini); }
-.yt-main.panel-open        { margin-right: var(--panel-w); }
+/* .yt-main.panel-open — no margin-right; panel is position:fixed and overlays content */
 
 /* ── Home page ────────────────────────────────────────────── */
 .home-page { padding: 0 0 48px; }
@@ -936,6 +938,5 @@
   .yt-main.sidebar-collapsed { margin-left: 0; }
   .yt-sidebar { display: none; }
   .home-feed { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); padding: 12px; }
-  .yt-main.panel-open { margin-right: 0; }
   .sp-panel { width: 100%; }
 }

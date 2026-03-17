@@ -25,7 +25,7 @@ function extractVideoId(url) {
 // App
 // ---------------------------------------------------------------------------
 export default function App() {
-  const [sidebarOpen, setSidebarOpen]       = useState(true);
+  const [sidebarOpen, setSidebarOpen]       = useState(false);
   const [view, setView]                     = useState('home');       // 'home' | 'watch'
   const [videoId, setVideoId]               = useState(null);
   const [videoInfo, setVideoInfo]           = useState(null);

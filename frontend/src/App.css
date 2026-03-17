@@ -805,19 +805,21 @@
 /* Controls strip at the bottom-right of the player */
 .player-overlay__controls {
   position: absolute;
-  bottom: 0;
+  bottom: 56px;        /* sit above YouTube's native controls bar (~48px) */
   right: 0;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 4px;
-  padding: 8px 10px;
-  /* Gradient so buttons are legible over any frame */
-  background: linear-gradient(to top, rgba(0,0,0,0.55) 0%, transparent 100%);
-  width: 100%;
+  padding: 4px 10px;
   justify-content: flex-end;
   opacity: 0;
   transition: opacity 0.25s ease;
-  pointer-events: auto;
+  /*
+   * IMPORTANT: keep this none so the gradient / container does NOT swallow
+   * mouse events — those must reach the YouTube iframe (progress bar, etc.).
+   * Individual buttons re-enable pointer-events explicitly below.
+   */
+  pointer-events: none;
 }
 
 /* Show the controls strip when hovering the player box */
@@ -827,6 +829,11 @@
 }
 
 /* Fullscreen toggle button */
+.player-fs-btn,
+.player-cart-btn {
+  pointer-events: auto;   /* re-enable on the actual buttons */
+}
+
 .player-fs-btn {
   width: 40px;
   height: 40px;

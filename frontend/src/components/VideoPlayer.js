@@ -39,6 +39,31 @@ export default function VideoPlayer({ videoId, onTimeUpdate }) {
   const intervalRef = useRef(null);
   const mountedRef = useRef(true);
 
+  // Arrow-key seek: ← / → skip ±5 seconds (matches YouTube behaviour)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Don't intercept while the user is typing in an input / textarea
+      const tag = document.activeElement?.tagName?.toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      const player = playerRef.current;
+      if (!player?.getCurrentTime) return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        const t = player.getCurrentTime();
+        player.seekTo(Math.max(0, t - 5), /* allowSeekAhead */ true);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        const t = player.getCurrentTime();
+        player.seekTo(t + 5, /* allowSeekAhead */ true);
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []); // refs are stable — no dep needed
+
   const startPolling = useCallback(() => {
     clearInterval(intervalRef.current);
     intervalRef.current = setInterval(() => {

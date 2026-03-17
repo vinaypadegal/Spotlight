@@ -231,168 +231,43 @@ def get_transcript(video_id: str) -> Dict:
     return result
 
 
-# def get_transcript(video_id: str) -> Dict:
-#     """
-#     Fetch English transcript for a YouTube video using YouTube Data API.
-    
-#     Args:
-#         video_id: YouTube video ID
-        
-#     Returns:
-#         Dictionary containing transcript data
-        
-#     Raises:
-#         Exception: If English transcript is not available or API key is missing
-#     """
-#     # Get YouTube Data API key from environment
-#     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
-#     api_key = os.environ.get('YOUTUBE_API_KEY')
-#     if not api_key:
-#         raise Exception("YOUTUBE_API_KEY environment variable is not set. Please set it in your .env file.")
-    
-#     try:
-#         # Build YouTube Data API service
-#         youtube = build('youtube', 'v3', developerKey=api_key)
-        
-#         # List caption tracks for the video
-#         captions_list_response = youtube.captions().list(
-#             part='snippet',
-#             videoId=video_id
-#         ).execute()
-
-#         print(captions_list_response)
-        
-#         if not captions_list_response.get('items'):
-#             raise Exception("No captions available for this video.")
-        
-#         # Find English caption track (prefer manually created over auto-generated)
-#         english_caption_id = None
-#         is_auto_generated = None
-        
-#         # First, try to find manually created English caption
-#         for caption in captions_list_response['items']:
-#             snippet = caption.get('snippet', {})
-#             if snippet.get('language') == 'en' and not snippet.get('trackKind') == 'ASR':
-#                 english_caption_id = caption['id']
-#                 is_auto_generated = False
-#                 break
-        
-#         # If no manually created, try auto-generated
-#         if not english_caption_id:
-#             for caption in captions_list_response['items']:
-#                 snippet = caption.get('snippet', {})
-#                 if snippet.get('language') == 'en' and snippet.get('trackKind') == 'ASR':
-#                     english_caption_id = caption['id']
-#                     is_auto_generated = True
-#                     break
-        
-#         if not english_caption_id:
-#             # List available languages for error message
-#             available_languages = []
-#             for caption in captions_list_response['items']:
-#                 snippet = caption.get('snippet', {})
-#                 lang = snippet.get('language', 'unknown')
-#                 lang_name = snippet.get('name', lang)
-#                 is_asr = snippet.get('trackKind') == 'ASR'
-#                 available_languages.append(f"{lang_name} ({lang}){' [auto-generated]' if is_asr else ''}")
-            
-#             if available_languages:
-#                 lang_list = ', '.join(available_languages[:5])
-#                 raise Exception(f"English transcript is not available for this video. Available languages: {lang_list}")
-#             else:
-#                 raise Exception("English transcript is not available for this video. No transcripts are available for this video.")
-        
-#         # Download the caption track (returns bytes)
-#         import io
-#         caption_response = youtube.captions().download(
-#             id=english_caption_id,
-#             tfmt='srt'  # SubRip format
-#         ).execute()
-        
-#         # Parse the SRT format and convert to our format
-#         transcript_data = []
-#         text_lines = []
-        
-#         # SRT format parsing - response is bytes
-#         srt_content = caption_response.decode('utf-8') if isinstance(caption_response, bytes) else str(caption_response)
-#         srt_blocks = srt_content.strip().split('\n\n')
-        
-#         def srt_time_to_seconds(srt_time):
-#             """Convert SRT time format (HH:MM:SS,mmm) to seconds"""
-#             try:
-#                 time_part, ms = srt_time.split(',')
-#                 h, m, s = map(int, time_part.split(':'))
-#                 return h * 3600 + m * 60 + s + int(ms) / 1000.0
-#             except:
-#                 return 0.0
-        
-#         for block in srt_blocks:
-#             lines = [line.strip() for line in block.split('\n') if line.strip()]
-#             if len(lines) >= 3:
-#                 # Parse timecode (format: 00:00:00,000 --> 00:00:05,000)
-#                 timecode = lines[1]
-#                 if '-->' in timecode:
-#                     try:
-#                         start_str, end_str = timecode.split(' --> ')
-#                         start = srt_time_to_seconds(start_str)
-#                         end = srt_time_to_seconds(end_str)
-#                         duration = end - start
-                        
-#                         # Get text (all lines after timecode)
-#                         text = ' '.join(lines[2:])
-                        
-#                         transcript_data.append({
-#                             'text': text,
-#                             'start': start,
-#                             'duration': duration
-#                         })
-#                         text_lines.append(text)
-#                     except Exception as e:
-#                         # Skip malformed blocks
-#                         continue
-        
-#         # Combine all text
-#         text_transcript = ' '.join(text_lines)
-        
-#         return {
-#             'video_id': video_id,
-#             'language': 'en',
-#             'transcript': transcript_data,
-#             'text': text_transcript,
-#             'word_count': len(text_transcript.split()),
-#             'is_auto_generated': is_auto_generated
-#         }
-        
-#     except HttpError as e:
-#         error_content = e.content.decode('utf-8') if e.content else str(e)
-#         if e.resp.status == 403:
-#             raise Exception(f"YouTube Data API error: Access forbidden. Check your API key and quota. {error_content}")
-#         elif e.resp.status == 404:
-#             raise Exception(f"Video or caption not found: {error_content}")
-#         else:
-#             raise Exception(f"YouTube Data API error: {error_content}")
-#     except Exception as e:
-#         error_msg = str(e)
-#         if "not available" in error_msg.lower():
-#             raise Exception(error_msg)
-#         else:
-#             raise Exception(f"Error fetching English transcript: {error_msg}")
-
-
 # Format selectors when ffmpeg IS available — separate video+audio streams give
 # the best quality because yt-dlp can mux them together.
+# ---------------------------------------------------------------------------
+# Format selectors
+#
+# Priority (when ffmpeg IS available):
+#   1. Best H.264 (avc1) video up to 1080p + best m4a audio
+#      → cleanest result for OpenCV frame extraction; no transcode needed.
+#   2. Any video codec up to 1080p + best audio
+#      → ffmpeg will remux to mp4 (VP9 / AV1 end up in an mp4 container).
+#   3. Best progressive stream up to 1080p, then absolute fallback.
+#
+# We deliberately cap at 1080p — Gemini Vision doesn't benefit from 4K
+# frames, and 4K downloads are 4-8× larger and slower to process.
+#
+# merge_output_format='mp4' (set in download_video) ensures the output
+# file is always an mp4 container that OpenCV can reliably read, even
+# when the selected video stream is VP9 or AV1.
+# ---------------------------------------------------------------------------
 _FORMAT_SELECTORS_WITH_FFMPEG = {
-    'mp4':  'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-    'webm': 'bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]/best',
-    'mkv':  'bestvideo+bestaudio/best',
+    'mp4': (
+        'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]'   # H.264 1080p — best for OpenCV
+        '/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]'                # H.264 any height
+        '/bestvideo[height<=1080]+bestaudio'                          # Any codec up to 1080p
+        '/best[height<=1080]'                                         # Progressive 1080p fallback
+        '/best'                                                        # Absolute fallback
+    ),
+    'webm': 'bestvideo[ext=webm][height<=1080]+bestaudio[ext=webm]/best[ext=webm]/best',
+    'mkv':  'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
 }
 
 # Format selectors when ffmpeg is NOT available — restrict to pre-merged
 # progressive streams so no muxing step is needed.
 _FORMAT_SELECTORS_NO_FFMPEG = {
-    'mp4':  'best[ext=mp4]/best',
-    'webm': 'best[ext=webm]/best',
-    'mkv':  'best',
+    'mp4':  'best[height<=1080][ext=mp4]/best[ext=mp4]/best',
+    'webm': 'best[height<=1080][ext=webm]/best[ext=webm]/best',
+    'mkv':  'best[height<=1080]/best',
 }
 
 
@@ -426,11 +301,14 @@ def download_video(youtube_url: str, download_path: str = "videos", format: str 
     ffmpeg_available = shutil.which('ffmpeg') is not None
     if ffmpeg_available:
         format_selector = _FORMAT_SELECTORS_WITH_FFMPEG.get(format, _FORMAT_SELECTORS_WITH_FFMPEG['mp4'])
-        logger.debug("ffmpeg found — using high-quality muxed format selector")
+        logger.debug(
+            "ffmpeg found — using high-quality format selector (H.264 ≤1080p preferred, "
+            "merge_output_format=mp4): %s", format_selector,
+        )
     else:
         format_selector = _FORMAT_SELECTORS_NO_FFMPEG.get(format, _FORMAT_SELECTORS_NO_FFMPEG['mp4'])
         logger.warning(
-            "ffmpeg not found — falling back to pre-merged formats. "
+            "ffmpeg not found — falling back to pre-merged progressive streams (≤1080p). "
             "Install ffmpeg for best quality: brew install ffmpeg"
         )
 
@@ -448,6 +326,10 @@ def download_video(youtube_url: str, download_path: str = "videos", format: str 
         **_base_ydl_opts(quiet=False),  # show yt-dlp's own output in the terminal
         'format': format_selector,
         'outtmpl': outtmpl,
+        # When ffmpeg is available, always produce an mp4 container so OpenCV
+        # can read the file reliably — this remuxes (fast) if the selected
+        # streams are already avc1/m4a, or transcodes (slower) otherwise.
+        **({"merge_output_format": "mp4"} if ffmpeg_available else {}),
         # Retry fragmented streams and file writes robustly
         'retries': 10,
         'fragment_retries': 10,

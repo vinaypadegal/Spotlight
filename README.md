@@ -99,11 +99,24 @@ Spotlight/
 ```bash
 git clone https://github.com/yourname/spotlight.git
 cd spotlight
-cp .env.example .env
-# Fill in GEMINI_API_KEY in .env
 ```
 
-### 2. Install dependencies
+### 2. Add your API keys
+
+Open the `.env` file and fill in the required keys before doing anything else:
+
+```env
+# Required — get a free key at https://aistudio.google.com/
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Optional — enable real shopping links, prices & thumbnails
+SERPER_DEV_API_KEY=your_serper_key_here
+```
+
+> **The app will not run without `GEMINI_API_KEY`.**  
+> `SERPER_DEV_API_KEY` is only needed if you set `ENRICH_PRODUCTS=true`.
+
+### 4. Install dependencies
 
 ```bash
 python3 -m venv venv
@@ -113,7 +126,7 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
-### 3. Start everything
+### 5. Start everything
 
 ```bash
 ./start.sh
@@ -127,10 +140,14 @@ This launches both the FastAPI backend (`http://localhost:8080`) and the React f
 
 | Variable | Required | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | Yes | Google AI / Gemini API key |
+| `GEMINI_API_KEY` | **Yes** | Google AI / Gemini API key — [get one free](https://aistudio.google.com/) |
 | `GEMINI_MODEL` | No | Primary model (default: `gemini-2.5-flash`) |
 | `GEMINI_FALLBACK_MODEL` | No | Fallback on 503/429 (default: `gemini-2.0-flash`) |
 | `DEBUG` | No | Set to `true` for verbose per-stage output logs |
+| `ENRICH_PRODUCTS` | No | Set to `true` to fetch real prices, links & thumbnails (default: `false`) |
+| `SERPER_DEV_API_KEY` | If enriching | Serper.dev key for Google Shopping searches —(https://serper.dev) |
+| `ENRICH_LOCATION` | No | Location for price localisation (default: `United States`) |
+| `ENRICH_CURRENCY` | No | Currency code for pricing (default: `USD`) |
 
 ---
 

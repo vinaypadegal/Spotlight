@@ -14,7 +14,7 @@ Why Serper.dev?
 Controlled entirely by environment variables:
 
   ENRICH_PRODUCTS=true       Enable enrichment (default: false)
-  SERPER_API_KEY=<your_key>  Serper.dev API key
+  SERPER_DEV_API_KEY=<your_key>  Serper.dev API key
                              Get a free key at https://serper.dev
   ENRICH_LOCATION=<place>    Location for price/availability localisation
                              (default: "United States")
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Configuration (read once at import time)
 # ---------------------------------------------------------------------------
 ENRICH_PRODUCTS = os.environ.get("ENRICH_PRODUCTS", "false").lower() == "true"
-SERPER_API_KEY  = os.environ.get("SERPER_API_KEY", "")
+SERPER_DEV_API_KEY  = os.environ.get("SERPER_DEV_API_KEY", "")
 ENRICH_LOCATION = os.environ.get("ENRICH_LOCATION", "United States")
 # Two-letter country code used as the `gl` (geo-location) parameter
 # Maps common currency codes to Serper gl codes; falls back to "us"
@@ -121,7 +121,7 @@ def _search_product(name: str, brand: Optional[str]) -> Dict:
         return _stub
 
     headers = {
-        "X-API-KEY":    SERPER_API_KEY,
+        "X-API-KEY":    SERPER_DEV_API_KEY,
         "Content-Type": "application/json",
     }
     payload = {
@@ -225,14 +225,14 @@ def enrich_detections(result: Dict) -> Dict:
     if not ENRICH_PRODUCTS:
         logger.debug(
             "[enrich] ENRICH_PRODUCTS=false — skipping. "
-            "Set ENRICH_PRODUCTS=true and SERPER_API_KEY in .env to enable."
+            "Set ENRICH_PRODUCTS=true and SERPER_DEV_API_KEY in .env to enable."
         )
         return result
 
-    if not SERPER_API_KEY:
+    if not SERPER_DEV_API_KEY:
         logger.error(
-            "[enrich] ENRICH_PRODUCTS=true but SERPER_API_KEY is not set. "
-            "Add SERPER_API_KEY=<your_key> to .env (free key at https://serper.dev)."
+            "[enrich] ENRICH_PRODUCTS=true but SERPER_DEV_API_KEY is not set. "
+            "Add SERPER_DEV_API_KEY=<your_key> to .env (free key at https://serper.dev)."
         )
         return result
 

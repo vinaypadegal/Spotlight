@@ -817,7 +817,7 @@ async def debug_serper(q: str = Query(..., description="Search query to send to 
     """
     import requests as _requests
     from enrich import (
-        SERPER_API_KEY as _KEY,
+        SERPER_DEV_API_KEY as _KEY,
         _SERPER_ENDPOINT as _ENDPOINT,
         _GL,
         ENRICH_LOCATION,
@@ -827,7 +827,7 @@ async def debug_serper(q: str = Query(..., description="Search query to send to 
     if not _KEY:
         raise HTTPException(
             status_code=503,
-            detail="SERPER_API_KEY is not set. Add it to .env and restart.",
+            detail="SERPER_DEV_API_KEY is not set. Add it to .env and restart.",
         )
 
     payload = {"q": q, "gl": _GL, "hl": "en", "num": 5}

@@ -34,6 +34,7 @@ from ingest import (
 from frames import extract_frames
 from vision import analyze_frames, analyze_youtube_url
 from merge import merge as merge_results
+from enrich import enrich_detections, ENRICH_PRODUCTS
 
 app = FastAPI(
     title="Spotlight API",
@@ -711,6 +712,51 @@ async def run_pipeline(request_body: PipelineRequest):
         steps["integration"] = {"status": "failed", "error": str(e)}
         # Non-fatal — still return vision + transcript raw results
 
+    # ------------------------------------------------------------------
+    # Step 6: Product enrichment (optional — ENRICH_PRODUCTS=true)
+    #   Queries SerpAPI Google Shopping for each unique product to fill in
+    #   real shopping_url, thumbnail_url, and price fields.
+    #   When disabled this is a fast no-op that just stamps price=None.
+    # ------------------------------------------------------------------
+    if merge_result:
+        try:
+            if ENRICH_PRODUCTS:
+                logger.info(
+                    "[6/6] Enriching %d detections via SerpAPI Google Shopping...",
+                    len(merge_result.get("detections", [])),
+                )
+            else:
+                logger.info("[6/6] Product enrichment disabled (ENRICH_PRODUCTS=false) — skipping.")
+
+            merge_result = enrich_detections(merge_result)
+
+            enriched = sum(
+                1 for d in merge_result.get("detections", [])
+                if d.get("shopping_url") and "google.com/search" not in d["shopping_url"]
+            )
+            steps["enrichment"] = {
+                "status":         "done" if ENRICH_PRODUCTS else "skipped",
+                "enriched_count": enriched if ENRICH_PRODUCTS else 0,
+                "reason":         None if ENRICH_PRODUCTS else "ENRICH_PRODUCTS=false",
+            }
+
+            # Re-save the detections file with enriched data
+            if ENRICH_PRODUCTS:
+                _det_path = (
+                    Path(__file__).parent.parent / "data" / "detections" / f"{video_id}.json"
+                )
+                try:
+                    with open(_det_path, "w", encoding="utf-8") as _fh:
+                        json.dump(merge_result, _fh, ensure_ascii=False, indent=2)
+                    logger.info("[6/6] Enriched detections saved to %s", _det_path)
+                except Exception as _save_err:
+                    logger.warning("[6/6] Could not re-save enriched detections: %s", _save_err)
+
+        except Exception as e:
+            logger.error("[6/6] Enrichment step failed: %s", e)
+            steps["enrichment"] = {"status": "failed", "error": str(e)}
+            # Non-fatal — pipeline continues with unenriched detections
+
     elapsed = round(_time.perf_counter() - _pipeline_start, 2)
     logger.info(
         "=== Pipeline complete: video_id='%s' in %.2fs ===",
@@ -755,6 +801,92 @@ async def get_cached_detections(video_id: str):
     with open(detections_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
     return {"success": True, "data": data}
+
+
+@app.get("/api/debug/serper")
+async def debug_serper(q: str = Query(..., description="Search query to send to Serper.dev Google Shopping")):
+    """
+    Debug endpoint: sends `q` directly to Serper.dev Google Shopping and returns
+    the raw API response alongside the enriched result that enrich.py would pick.
+
+    Useful for inspecting what Serper returns for a given product query so you can
+    understand why a particular shopping_url / thumbnail / price was chosen.
+
+    Example:
+        GET /api/debug/serper?q=Great+Value+Quick+Oats
+    """
+    import requests as _requests
+    from enrich import (
+        SERPER_API_KEY as _KEY,
+        _SERPER_ENDPOINT as _ENDPOINT,
+        _GL,
+        ENRICH_LOCATION,
+        _GOOGLE_PREFIXES,
+    )
+
+    if not _KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="SERPER_API_KEY is not set. Add it to .env and restart.",
+        )
+
+    payload = {"q": q, "gl": _GL, "hl": "en", "num": 5}
+    headers = {"X-API-KEY": _KEY, "Content-Type": "application/json"}
+
+    try:
+        resp = _requests.post(_ENDPOINT, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+    except _requests.exceptions.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Serper.dev returned HTTP {exc.response.status_code}: {exc}",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Serper.dev request failed: {exc}")
+
+    shopping: list = raw.get("shopping", [])
+
+    # Replicate the same selection logic used in enrich.py
+    def _is_direct(item: dict) -> bool:
+        url = item.get("link") or ""
+        return not any(url.startswith(p) for p in _GOOGLE_PREFIXES)
+
+    chosen = next((r for r in shopping if _is_direct(r)), shopping[0] if shopping else None)
+
+    return {
+        "query":    q,
+        "gl":       _GL,
+        "location": ENRICH_LOCATION,
+        "total_results": len(shopping),
+        # What enrich.py would actually pick
+        "chosen": {
+            "index":        shopping.index(chosen) if chosen else None,
+            "title":        chosen.get("title")    if chosen else None,
+            "source":       chosen.get("source")   if chosen else None,
+            "price":        chosen.get("price")    if chosen else None,
+            "shopping_url": chosen.get("link")     if chosen else None,
+            "thumbnail_url":chosen.get("imageUrl") if chosen else None,
+            "snippet":      (chosen.get("snippet") or chosen.get("description")) if chosen else None,
+            "is_direct_link": _is_direct(chosen)   if chosen else None,
+        } if chosen else None,
+        # Full raw Serper response for inspection
+        "raw_shopping_results": [
+            {
+                "index":      i,
+                "title":      r.get("title"),
+                "source":     r.get("source"),
+                "price":      r.get("price"),
+                "link":       r.get("link"),
+                "imageUrl":   r.get("imageUrl"),
+                "snippet":    r.get("snippet") or r.get("description"),
+                "rating":     r.get("rating"),
+                "ratingCount":r.get("ratingCount"),
+                "is_direct_link": _is_direct(r),
+            }
+            for i, r in enumerate(shopping)
+        ],
+    }
 
 
 if __name__ == '__main__':

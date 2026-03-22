@@ -35,8 +35,11 @@ Output shape (merge return value)
       "show_at":      float,       # seconds — when to show the ad overlay
       "hide_at":      float,       # seconds — when to hide it
       "confidence":   float | null,
-      "shopping_url": str | null,  # Google Shopping search URL
-      "thumbnail_url": null        # populated by enrich_thumbnails()
+      "shopping_url":  str | null,  # real product URL (enrich.py) or Google Shopping search URL
+      "thumbnail_url": str | null,  # product image (enrich.py); null when enrichment is off
+      "price":         str | null,  # price string e.g. "$29.99" (enrich.py); null when off
+      "snippet":       str | null,  # short product description (enrich.py); null when off
+      "source":        str | null   # retailer name e.g. "Amazon" (enrich.py); null when off
     },
     ...
   ],
@@ -423,7 +426,10 @@ def merge(
                 "hide_at":       window["hide_at"],
                 "confidence":    entry["confidence"],
                 "shopping_url":  shop_url,
-                "thumbnail_url": None,  # populated by enrich_thumbnails()
+                "thumbnail_url": None,   # populated by enrich.enrich_detections()
+                "price":         None,   # populated by enrich.enrich_detections()
+                "snippet":       None,   # populated by enrich.enrich_detections()
+                "source":        None,   # populated by enrich.enrich_detections()
             })
 
     # Sort by show_at, then assign sequential IDs
@@ -443,6 +449,9 @@ def merge(
             "confidence":    d["confidence"],
             "shopping_url":  d["shopping_url"],
             "thumbnail_url": d["thumbnail_url"],
+            "price":         d.get("price"),
+            "snippet":       d.get("snippet"),
+            "source":        d.get("source"),
         }
         for d in flat
     ]

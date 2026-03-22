@@ -4,6 +4,9 @@
 
 Spotlight watches a video the way a viewer does, identifies every brand and product on screen, cross-references them with what's said in the transcript, and overlays precise, time-synced shopping cards directly inside the player. No manual tagging. No sponsorship deals. Just computer vision, an LLM, and a clean YouTube-clone UI.
 
+![screenshot](screenshots/ss1.png)
+![screenshot](screenshots/ss2.png)
+
 ---
 
 ## How it works

@@ -720,75 +720,172 @@
 /* Product list */
 .sp-product-list { padding: 8px 12px; }
 
-/* Product card */
+/* ── Product card ─────────────────────────────────────────── */
 .sp-card {
   background: var(--yt-surface-2);
   border-radius: var(--radius);
-  padding: 14px;
+  padding: 12px 14px 10px;
   margin-bottom: 10px;
   border: 1px solid var(--yt-border);
-  transition: border-color var(--transition), background var(--transition);
-}
-.sp-card:hover { border-color: #555; background: #2d2d2d; }
-
-.sp-card__header {
+  transition: border-color var(--transition), background var(--transition),
+              box-shadow var(--transition);
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 10px;
+  flex-direction: column;
+  gap: 0;
 }
-.sp-card__name-block { flex: 1; min-width: 0; }
+.sp-card:hover {
+  border-color: #555;
+  background: #2a2a2a;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+}
 
+/* Hero row: thumbnail + text info */
+.sp-card__hero {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+/* Thumbnail */
+.sp-card__thumb-wrap {
+  flex-shrink: 0;
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--yt-border);
+  background: #1a1a1a;
+}
+.sp-card__thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.sp-card__thumb--placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--yt-text-secondary);
+}
+
+/* Right-side text column */
+.sp-card__info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* Brand row: brand label + confidence badge */
+.sp-card__brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
 .sp-card__brand {
-  display: inline-block;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.09em;
   color: var(--yt-blue);
-  margin-bottom: 3px;
-}
-.sp-card__name {
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 1.4;
-  color: var(--yt-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .sp-card__confidence {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: #4ade80;
   flex-shrink: 0;
   background: rgba(74,222,128,0.12);
-  padding: 2px 7px;
-  border-radius: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
 }
 
+/* Product name */
+.sp-card__name {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--yt-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Price + source inline */
+.sp-card__meta-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 2px;
+  flex-wrap: wrap;
+}
+.sp-card__price {
+  font-size: 14px;
+  font-weight: 700;
+  color: #4ade80;
+}
+.sp-card__source {
+  font-size: 11px;
+  color: var(--yt-text-secondary);
+  background: rgba(255,255,255,0.06);
+  padding: 1px 6px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+/* Snippet */
+.sp-card__snippet {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--yt-text-secondary);
+  margin: 8px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Footer: category badge + delivery + shop button */
 .sp-card__footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  margin-top: 10px;
+}
+.sp-card__footer-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .sp-card__category {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
-  padding: 3px 8px;
-  border-radius: 12px;
+  padding: 2px 7px;
+  border-radius: 10px;
   border: 1px solid;
   text-transform: capitalize;
+  white-space: nowrap;
 }
 .sp-card__shop-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 6px 14px;
+  gap: 4px;
+  padding: 6px 13px;
   border-radius: 18px;
   background: var(--yt-blue);
   color: #0a0a0a;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: background var(--transition), transform var(--transition);
   text-decoration: none;
 }

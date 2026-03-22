@@ -51,8 +51,12 @@ if [ -f "$ENV_FILE" ]; then
         [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
         # Don't override variables already set in the calling environment
         key="${line%%=*}"
+        val="${line#*=}"
+        # Strip surrounding single or double quotes from the value
+        val="${val%\'}" ; val="${val#\'}"
+        val="${val%\"}" ; val="${val#\"}"
         if [ -z "${!key+x}" ]; then
-            export "$line"
+            export "$key=$val"
         fi
     done < "$ENV_FILE"
 else

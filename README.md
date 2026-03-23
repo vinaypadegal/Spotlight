@@ -47,8 +47,6 @@ The pipeline is **idempotent**: re-running skips the download and transcript fet
 | **Gemini Vision (batched)** | Frames are sent in parallel batches; a refinement pass consolidates near-duplicate names across batches |
 | **Transcript-aware** | Spoken brand mentions resolve ambiguous or off-screen detections |
 | **Retry + fallback model** | Transient Gemini 503/429 errors trigger exponential back-off and automatic fallback to a secondary model |
-| **YouTube clone UI** | Dark-mode React UI that mirrors YouTube's layout; the cart button lives inside the player and works in fullscreen |
-| **Arrow-key seeking** | Left/Right arrows skip ±5 s, matching YouTube's native behaviour |
 | **Caching** | Videos and transcripts are saved to disk; the pipeline skips completed stages on re-run |
 
 ---

@@ -1,10 +1,9 @@
 import json
 import logging
-import base64
 import os
 import shutil
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 import cv2
 
@@ -17,43 +16,83 @@ os.makedirs(FRAMES_DIR, exist_ok=True)
 
 
 def extract_frames(
-    video_path: str,
     video_id: str,
     interval_seconds: float = 2.0,
-) -> List[Dict]:
+    video_path: Optional[str] = None,
+) -> Dict:
     """
-    Extract one frame every `interval_seconds` from a video file.
+    Extract one frame every ``interval_seconds`` from a video file.
 
-    Frames are saved as JPEGs under frames/<video_id>/ and also returned
-    as base64 strings so they can be passed directly to vision APIs
-    (e.g. Gemini Vision) without a second file read.
+    Stateless — ``video_path`` defaults to ``data/videos/<video_id>.mp4`` so
+    callers only need to supply the ``video_id``.
 
-    Uses direct frame seeking (CAP_PROP_POS_MSEC) instead of reading every
-    frame and discarding most of them, which is significantly faster on
-    long videos.
+    Idempotent — if ``data/frames/<video_id>/frames.json`` already exists and
+    was produced at the same interval, the cached metadata is returned
+    immediately without re-reading the video (``cached=True`` in the result).
+
+    Frames are saved as JPEGs under ``data/frames/<video_id>/`` and a metadata
+    file ``frames.json`` is written to the same directory.  ``frame_b64`` is
+    NOT included in the return value; callers that need raw pixels (e.g.
+    ``vision.analyze_frames``) load images directly from the paths in
+    ``frame_path``.
 
     Args:
-        video_path:        Path to the video file.
-        video_id:          Used to name the output folder and files.
-        interval_seconds:  Gap between extracted frames in seconds (default 1.0).
+        video_id:          Used to name the output folder and derive the
+                           default video path.
+        interval_seconds:  Gap between extracted frames in seconds (default 2.0).
+        video_path:        Override the default video file path.
 
     Returns:
-        List of dicts, each containing:
-          - timestamp    (float)  — position in the video in seconds
-          - frame_path   (str)    — path to the saved JPEG on disk
-          - frame_b64    (str)    — base64-encoded JPEG for direct API use
+        {
+          "video_id":         str,
+          "interval_seconds": float,
+          "frame_count":      int,
+          "frames":           [{"timestamp": float, "frame_path": str}, ...],
+          "cached":           bool,
+        }
     """
-    video_path = str(video_path)
-    cap = cv2.VideoCapture(video_path)
+    # Derive the video path if not supplied
+    if video_path is None:
+        video_path = str(_PROJECT_ROOT / "data" / "videos" / f"{video_id}.mp4")
+
+    output_dir = Path(FRAMES_DIR) / video_id
+    frames_json_path = output_dir / "frames.json"
+
+    # ------------------------------------------------------------------
+    # Idempotency check — return cached result if the interval matches
+    # ------------------------------------------------------------------
+    if frames_json_path.exists():
+        try:
+            cached_meta = json.loads(frames_json_path.read_text(encoding="utf-8"))
+            if abs(cached_meta.get("interval_seconds", -1) - interval_seconds) < 1e-6:
+                logger.info(
+                    "Frames already extracted at %.1fs intervals, "
+                    "loading from cache → %s  (%d frames)",
+                    interval_seconds, frames_json_path, cached_meta.get("frame_count", 0),
+                )
+                return {**cached_meta, "cached": True}
+            else:
+                logger.info(
+                    "Cached frames were at %.1fs intervals but %.1fs requested — re-extracting",
+                    cached_meta.get("interval_seconds"), interval_seconds,
+                )
+        except Exception as cache_err:
+            logger.warning("Could not read cached frames.json (%s), re-extracting...", cache_err)
+
+    # ------------------------------------------------------------------
+    # Fresh extraction
+    # ------------------------------------------------------------------
+    video_path_str = str(video_path)
+    cap = cv2.VideoCapture(video_path_str)
     if not cap.isOpened():
-        raise ValueError(f"Could not open video file: '{video_path}'")
+        raise ValueError(f"Could not open video file: '{video_path_str}'")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if fps <= 0:
         cap.release()
-        raise ValueError(f"Could not read FPS from video: '{video_path}'")
+        raise ValueError(f"Could not read FPS from video: '{video_path_str}'")
 
     duration_seconds = total_frames / fps
     expected_count = int(duration_seconds / interval_seconds) + 1
@@ -64,16 +103,14 @@ def extract_frames(
         video_id, duration_seconds, fps, interval_seconds, expected_count,
     )
 
-    # Create (or overwrite) a dedicated subfolder for this video's frames.
-    # If the directory already exists from a previous run, wipe it first so
-    # stale frames from different intervals don't accumulate.
-    output_dir = Path(FRAMES_DIR) / video_id
+    # Wipe the output directory so stale frames from a previous interval
+    # don't accumulate alongside the new ones.
     if output_dir.exists():
         shutil.rmtree(output_dir)
         logger.debug("Removed existing frames directory for '%s' (overwrite)", video_id)
     output_dir.mkdir(parents=True)
 
-    frames: List[Dict] = []
+    frames_meta: List[Dict] = []
     timestamp = 0.0
 
     while timestamp <= duration_seconds:
@@ -88,41 +125,29 @@ def extract_frames(
         frame_path = output_dir / f"{timestamp:.3f}.jpg"
         cv2.imwrite(str(frame_path), frame)
 
-        with open(frame_path, 'rb') as f:
-            frame_b64 = base64.b64encode(f.read()).decode('utf-8')
-
-        frames.append({
+        frames_meta.append({
             "timestamp": round(timestamp, 3),
             "frame_path": str(frame_path),
-            "frame_b64": frame_b64,
         })
 
         logger.debug("Saved frame at %.3fs → %s", timestamp, frame_path.name)
         timestamp += interval_seconds
 
     cap.release()
-    logger.info("Done — extracted %d frames for '%s'", len(frames), video_id)
+    logger.info("Done — extracted %d frames for '%s'", len(frames_meta), video_id)
 
-    # --- Save metadata to frames.json (frame_b64 omitted to keep file small) ---
-    frames_json_path = output_dir / "frames.json"
-    frames_meta = [
-        {"timestamp": f["timestamp"], "frame_path": f["frame_path"]}
-        for f in frames
-    ]
+    # Write metadata to frames.json
+    result = {
+        "video_id":         video_id,
+        "interval_seconds": interval_seconds,
+        "frame_count":      len(frames_meta),
+        "frames":           frames_meta,
+    }
     with open(frames_json_path, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "video_id": video_id,
-                "interval_seconds": interval_seconds,
-                "frame_count": len(frames_meta),
-                "frames": frames_meta,
-            },
-            fh,
-            indent=2,
-        )
+        json.dump(result, fh, indent=2)
     logger.info("Frame metadata written to '%s'", frames_json_path)
 
-    return frames
+    return {**result, "cached": False}
 
 
 def cleanup_frames(video_id: str) -> int:

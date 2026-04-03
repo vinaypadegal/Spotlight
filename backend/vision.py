@@ -6,6 +6,7 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, TypeVar
 
 T = TypeVar("T")
@@ -22,6 +23,11 @@ GEMINI_MODEL          = os.environ.get("GEMINI_MODEL",          "gemini-2.5-flas
 # Fallback model used when the primary is unavailable (503/429).
 # A lighter/different model is less likely to be overloaded at the same time.
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash")
+
+# Frames data directory — anchored to the project root so this module works
+# regardless of which directory the server is launched from.
+_PROJECT_ROOT = Path(__file__).parent.parent
+_FRAMES_ROOT  = _PROJECT_ROOT / "data" / "frames"
 
 # How many frames to pack into one API call.
 # Gemini's context window is large, but 10 images per call is a sweet spot
@@ -460,26 +466,31 @@ def _refine_detections(frames_out: List[Dict], client: genai.Client) -> List[Dic
 # -------------------------------------------------------------------------
 
 def analyze_frames(
-    frames: List[Dict],
+    video_id: str,
     api_key: Optional[str] = None,
     batch_size: int = BATCH_SIZE,
     max_workers: int = MAX_WORKERS,
 ) -> Dict:
     """
     Analyse video frames with Gemini Vision to detect brands, products and
-    purchasable items, then generate Google Shopping links for each.
+    purchasable items.
+
+    Stateless — reads frame metadata from ``data/frames/<video_id>/frames.json``
+    and loads each JPEG from disk rather than accepting an in-memory frame list.
+    This decouples the function from ``extract_frames`` and allows it to be
+    called independently (e.g. after a server restart).
 
     Efficiency strategy:
       - Batching   — multiple frames are packed into a single API call,
                      reducing round-trips and prompt overhead.
       - Parallelism — batches are dispatched concurrently via a thread pool,
                      so API latency doesn't compound across batches.
-      - Dedup      — products are deduplicated by search_query across all
-                     frames so the final shopping list has no redundancy.
+      - Dedup      — products are deduplicated across all frames so the final
+                     product list has no redundancy.
 
     Args:
-        frames:      Output of frames.extract_frames() — list of dicts with
-                     keys: timestamp, frame_path, frame_b64.
+        video_id:    YouTube video ID whose extracted frames to analyse.
+                     Frames must already exist under data/frames/<video_id>/.
         api_key:     Gemini API key. Falls back to GEMINI_API_KEY env var.
         batch_size:  Frames per Gemini API call (default 10).
         max_workers: Max concurrent API calls (default 4).
@@ -510,12 +521,41 @@ def analyze_frames(
     """
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise Exception(
-            "GEMINI_API_KEY is not set. Add it to your .env file."
+        raise Exception("GEMINI_API_KEY is not set. Add it to your .env file.")
+
+    # ------------------------------------------------------------------
+    # Load frame metadata from disk
+    # ------------------------------------------------------------------
+    frames_json_path = _FRAMES_ROOT / video_id / "frames.json"
+    if not frames_json_path.exists():
+        raise FileNotFoundError(
+            f"No frames found for video_id='{video_id}'. "
+            f"Run frame extraction first (expected: {frames_json_path})."
         )
 
+    meta = json.loads(frames_json_path.read_text(encoding="utf-8"))
+    frame_metas = meta.get("frames", [])
+    logger.info(
+        "Loading %d frames from disk for video_id='%s'",
+        len(frame_metas), video_id,
+    )
+
+    frames: List[Dict] = []
+    for fm in frame_metas:
+        fp = Path(fm["frame_path"])
+        if not fp.exists():
+            logger.warning("Frame file missing, skipping: %s", fp)
+            continue
+        with open(fp, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("utf-8")
+        frames.append({
+            "timestamp":  fm["timestamp"],
+            "frame_path": str(fp),
+            "frame_b64":  b64,
+        })
+
     if not frames:
-        logger.warning("No frames provided — returning empty result")
+        logger.warning("No usable frames found for '%s' — returning empty result", video_id)
         return {
             "frames": [],
             "summary": {

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Dict, Optional, List
 import os
 import json
 import logging
@@ -25,11 +25,9 @@ logging.basicConfig(
 from ingest import (
     get_video_info,
     get_transcript,
-    get_video_with_transcript,
     extract_video_id,
     download_video,
     VIDEOS_DIR,
-    TRANSCRIPTS_DIR,
 )
 from frames import extract_frames
 from vision import analyze_frames, analyze_youtube_url
@@ -178,39 +176,6 @@ async def fetch_transcript(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/youtube/video-with-transcript")
-@app.post("/api/youtube/video-with-transcript")
-async def fetch_video_with_transcript(
-    url: Optional[str] = Query(None, description="YouTube video URL or video ID"),
-    languages: Optional[str] = Query(None, description="Ignored - only English transcripts are supported"),
-    request_body: Optional[VideoWithTranscriptRequest] = Body(None)
-):
-    """
-    Fetch both YouTube video information and English transcript.
-    
-    Note: Only English transcripts are currently supported.
-    
-    Can be called with GET (query parameters) or POST (JSON body).
-    """
-    try:
-        # Support both GET (query params) and POST (body)
-        if request_body:
-            video_url = request_body.url
-        else:
-            video_url = url
-        
-        if not video_url:
-            raise HTTPException(status_code=400, detail="URL parameter is required")
-        
-        # Only fetch English transcript
-        result = get_video_with_transcript(video_url)
-        return {"success": True, "data": result}
-    
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/youtube/download")
 @app.post("/api/youtube/download")
@@ -281,33 +246,21 @@ async def extract_video_frames(
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
 
-        video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
-
-        # Always (re-)download — yt-dlp will overwrite the file if it exists,
-        # ensuring the local copy is never stale.
+        # download_video is idempotent — skips if file already exists
         download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
 
-        frames = extract_frames(
-            video_path=video_path,
-            video_id=video_id,
-            interval_seconds=interval,
-        )
-
-        # Strip frame_b64 from the response — it's only needed internally for
-        # vision analysis and would make the payload unnecessarily large.
-        # The full metadata is also persisted to frames/<video_id>/frames.json.
-        frames_meta = [
-            {"timestamp": f["timestamp"], "frame_path": f["frame_path"]}
-            for f in frames
-        ]
+        # extract_frames is idempotent — skips if frames.json already exists
+        # at the same interval; returns a dict (not a list)
+        frames_result = extract_frames(video_id=video_id, interval_seconds=interval)
 
         return {
             "success": True,
             "data": {
-                "video_id": video_id,
-                "interval_seconds": interval,
-                "frame_count": len(frames_meta),
-                "frames": frames_meta,
+                "video_id":         frames_result["video_id"],
+                "interval_seconds": frames_result["interval_seconds"],
+                "frame_count":      frames_result["frame_count"],
+                "frames":           frames_result["frames"],
+                "cached":           frames_result.get("cached", False),
             },
         }
 
@@ -363,20 +316,12 @@ async def analyze_video_frames(
             )
         else:
             # --- Full path: download → extract frames → Gemini ---
-            video_path = f"{VIDEOS_DIR}/{video_id}.mp4"
-
-            # Always (re-)download so the local copy is never stale
+            # Both steps are idempotent — they skip if outputs already exist
             download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
+            extract_frames(video_id=video_id, interval_seconds=interval)
 
-            # Extract frames at the requested interval
-            frames = extract_frames(
-                video_path=video_path,
-                video_id=video_id,
-                interval_seconds=interval,
-            )
-
-            # Analyse with Gemini Vision
-            result = analyze_frames(frames)
+            # analyze_frames is stateless — reads frames from disk by video_id
+            result = analyze_frames(video_id)
 
         return {"success": True, "data": result}
 
@@ -438,157 +383,104 @@ async def run_pipeline(request_body: PipelineRequest):
 
     # ------------------------------------------------------------------
     # Step 1: Download video + fetch metadata (title, duration)
-    #   Skip if the video file is already on disk — saves bandwidth and
-    #   time on re-runs.  We still call get_video_info() to obtain the
-    #   title / duration without triggering a full download.
+    #   download_video() is idempotent — it skips the download and returns
+    #   cached metadata if the file is already on disk.
     # ------------------------------------------------------------------
     video_title: Optional[str] = None
     video_duration: Optional[float] = None
-    video_path = str(Path(VIDEOS_DIR) / f"{video_id}.mp4")
 
-    if Path(video_path).exists():
-        logger.info(
-            "[1/5] Video already on disk, skipping download → %s", video_path
-        )
-        try:
-            info = get_video_info(video_url)
-            video_title    = info.get("title")
-            video_duration = info.get("duration")
-        except Exception as meta_err:
-            logger.warning("[1/5] Could not fetch video metadata: %s", meta_err)
-
+    try:
+        logger.info("[1/6] Download step (skips if already on disk)...")
+        download_result = download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
+        video_title    = download_result.get("title")
+        video_duration = download_result.get("duration")
+        cached = download_result.get("cached", False)
         steps["download"] = {
-            "status":     "skipped",
-            "reason":     "Video file already exists on disk",
-            "video_path": video_path,
+            "status":     "skipped" if cached else "done",
+            "video_path": download_result.get("file_path"),
             "title":      video_title,
             "duration":   video_duration,
         }
-        logger.debug(
-            "[1/5] Metadata — title=%r  duration=%ss",
-            video_title, video_duration,
-        )
-    else:
-        try:
-            logger.info("[1/5] Downloading video...")
-            download_result = download_video(video_url, download_path=VIDEOS_DIR, format="mp4")
-            video_title    = download_result.get("title")
-            video_duration = download_result.get("duration")
-            steps["download"] = {
-                "status":     "done",
-                "video_path": download_result.get("file_path"),
-                "title":      video_title,
-                "duration":   video_duration,
-            }
+        if cached:
+            logger.info("[1/6] Video already on disk — skipped (title=%r)", video_title)
+        else:
             logger.info(
-                "[1/5] Download complete → %s (title=%r, duration=%ss)",
+                "[1/6] Download complete → %s (title=%r, duration=%ss)",
                 download_result.get("file_path"), video_title, video_duration,
             )
-            logger.debug("[1/5] Full download result:\n%s", json.dumps(download_result, indent=2, default=str))
-        except Exception as e:
-            logger.error("[1/5] Download failed: %s", e)
-            steps["download"] = {"status": "failed", "error": str(e)}
-            raise HTTPException(
-                status_code=500,
-                detail=f"Pipeline failed at download step: {e}",
-            )
+        logger.debug("[1/6] Full download result:\n%s", json.dumps(download_result, indent=2, default=str))
+    except Exception as e:
+        logger.error("[1/6] Download failed: %s", e)
+        steps["download"] = {"status": "failed", "error": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline failed at download step: {e}",
+        )
 
     # ------------------------------------------------------------------
     # Step 2: Transcript
-    #   Skip if the transcript JSON file is already saved to disk — load
-    #   directly from file instead of hitting the YouTube API again.
+    #   get_transcript() is idempotent — it loads from disk if the JSON
+    #   file is already saved, without hitting the YouTube API again.
     # ------------------------------------------------------------------
     transcript_data = None
-    transcript_file = Path(TRANSCRIPTS_DIR) / f"{video_id}.json"
-
-    if transcript_file.exists():
-        try:
-            transcript_data = json.loads(transcript_file.read_text(encoding="utf-8"))
-            steps["transcript"] = {
-                "status":       "skipped",
-                "reason":       "Loaded from cached file on disk",
-                "language":     transcript_data.get("language"),
-                "word_count":   transcript_data.get("word_count"),
-                "is_generated": transcript_data.get("is_generated"),
-                "loaded_from":  str(transcript_file),
-            }
-            logger.info(
-                "[2/5] Transcript already on disk, loaded → %s  (%d words, %s)",
-                transcript_file,
-                transcript_data.get("word_count", 0),
-                "auto-generated" if transcript_data.get("is_generated") else "manual",
+    try:
+        logger.info("[2/6] Transcript step (loads from cache if available)...")
+        transcript_data = get_transcript(video_id)
+        cached = transcript_data.get("cached", False)
+        steps["transcript"] = {
+            "status":       "skipped" if cached else "done",
+            "language":     transcript_data.get("language"),
+            "word_count":   transcript_data.get("word_count"),
+            "is_generated": transcript_data.get("is_generated"),
+        }
+        action = "Loaded cached" if cached else "Fetched"
+        logger.info(
+            "[2/6] %s transcript — %d words (%s)",
+            action,
+            transcript_data.get("word_count", 0),
+            "auto-generated" if transcript_data.get("is_generated") else "manual",
+        )
+        segments = transcript_data.get("transcript", [])
+        if segments:
+            preview = segments[:5]
+            logger.debug(
+                "[2/6] Transcript preview (first %d/%d segments):\n%s",
+                len(preview), len(segments),
+                json.dumps(preview, indent=2, ensure_ascii=False),
             )
-            # Log first few segments so the user can inspect quality
-            segments = transcript_data.get("transcript", [])
-            if segments:
-                preview = segments[:5]
-                logger.debug(
-                    "[2/5] Transcript preview (first %d/%d segments):\n%s",
-                    len(preview), len(segments),
-                    json.dumps(preview, indent=2, ensure_ascii=False),
-                )
-        except Exception as load_err:
-            logger.warning(
-                "[2/5] Failed to load cached transcript (%s), re-fetching...", load_err
-            )
-            transcript_data = None  # fall through to re-fetch below
-
-    if transcript_data is None:
-        try:
-            logger.info("[2/5] Fetching transcript from YouTube...")
-            transcript_data = get_transcript(video_id)
-            steps["transcript"] = {
-                "status":       "done",
-                "language":     transcript_data.get("language"),
-                "word_count":   transcript_data.get("word_count"),
-                "is_generated": transcript_data.get("is_generated"),
-                "saved_to":     str(transcript_file),
-            }
-            logger.info(
-                "[2/5] Transcript fetched — %d words (%s)",
-                transcript_data.get("word_count", 0),
-                "auto-generated" if transcript_data.get("is_generated") else "manual",
-            )
-            segments = transcript_data.get("transcript", [])
-            if segments:
-                preview = segments[:5]
-                logger.debug(
-                    "[2/5] Transcript preview (first %d/%d segments):\n%s",
-                    len(preview), len(segments),
-                    json.dumps(preview, indent=2, ensure_ascii=False),
-                )
-        except Exception as e:
-            # Transcript is optional — log a warning and continue
-            logger.warning("[2/5] Transcript unavailable, skipping: %s", e)
-            steps["transcript"] = {"status": "skipped", "reason": str(e)}
+    except Exception as e:
+        # Transcript is optional — log a warning and continue
+        logger.warning("[2/6] Transcript unavailable, skipping: %s", e)
+        steps["transcript"] = {"status": "skipped", "reason": str(e)}
 
     # ------------------------------------------------------------------
     # Step 3: Frame extraction
+    #   extract_frames() is idempotent — if frames.json already exists for
+    #   the same interval_seconds it returns cached metadata immediately.
     # ------------------------------------------------------------------
-    frames = []
+    frames_result: Dict = {}
     try:
-        logger.info("[3/5] Extracting frames at %.1fs intervals...", interval)
-        frames = extract_frames(
-            video_path=video_path,
-            video_id=video_id,
-            interval_seconds=interval,
-        )
+        logger.info("[3/6] Frame extraction step (skips if already extracted at same interval)...")
+        frames_result = extract_frames(video_id=video_id, interval_seconds=interval)
+        cached = frames_result.get("cached", False)
+        frame_count = frames_result.get("frame_count", 0)
         steps["frames"] = {
-            "status":           "done",
-            "frame_count":      len(frames),
+            "status":           "skipped" if cached else "done",
+            "frame_count":      frame_count,
             "interval_seconds": interval,
             "saved_to":         f"frames/{video_id}/",
         }
-        logger.info("[3/5] Frame extraction done — %d frames", len(frames))
-        if frames:
-            preview_ts = [f["timestamp"] for f in frames[:10]]
+        action = "Loaded cached" if cached else "Extracted"
+        logger.info("[3/6] %s %d frames for '%s'", action, frame_count, video_id)
+        if frames_result.get("frames"):
+            preview_ts = [f["timestamp"] for f in frames_result["frames"][:10]]
             logger.debug(
-                "[3/5] First %d timestamps: %s%s",
+                "[3/6] First %d timestamps: %s%s",
                 len(preview_ts), preview_ts,
-                " …" if len(frames) > 10 else "",
+                " …" if frame_count > 10 else "",
             )
     except Exception as e:
-        logger.error("[3/5] Frame extraction failed: %s", e)
+        logger.error("[3/6] Frame extraction failed: %s", e)
         steps["frames"] = {"status": "failed", "error": str(e)}
         raise HTTPException(
             status_code=500,
@@ -597,11 +489,14 @@ async def run_pipeline(request_body: PipelineRequest):
 
     # ------------------------------------------------------------------
     # Step 4: Vision analysis (Gemini)
+    #   analyze_frames() is stateless — it reads frames from disk via
+    #   video_id, decoupled from the extract_frames return value.
     # ------------------------------------------------------------------
     vision_result = None
     try:
-        logger.info("[4/5] Running Gemini Vision on %d frames...", len(frames))
-        vision_result = analyze_frames(frames)
+        frame_count = frames_result.get("frame_count", 0)
+        logger.info("[4/6] Running Gemini Vision on %d frames...", frame_count)
+        vision_result = analyze_frames(video_id)
         summary = vision_result.get("summary", {})
         steps["vision"] = {
             "status":                 "done",
@@ -610,7 +505,7 @@ async def run_pipeline(request_body: PipelineRequest):
             "unique_product_count":   summary.get("unique_product_count", 0),
         }
         logger.info(
-            "[4/5] Vision done — %d unique products across %d/%d frames",
+            "[4/6] Vision done — %d unique products across %d/%d frames",
             summary.get("unique_product_count", 0),
             summary.get("frames_with_detections", 0),
             summary.get("total_frames", 0),
@@ -620,7 +515,7 @@ async def run_pipeline(request_body: PipelineRequest):
         unique_products = vision_result.get("unique_products", [])
         if unique_products:
             logger.info(
-                "[4/5] Unique products detected (%d):\n%s",
+                "[4/6] Unique products detected (%d):\n%s",
                 len(unique_products),
                 "\n".join(
                     f"  • {p.get('brand', '?')} — {p.get('name', '?')}  "
@@ -629,13 +524,13 @@ async def run_pipeline(request_body: PipelineRequest):
                 ),
             )
         else:
-            logger.info("[4/5] No products detected in this video.")
+            logger.info("[4/6] No products detected in this video.")
 
         # Full per-frame breakdown at DEBUG level
         vision_frames = vision_result.get("frames", [])
         frames_with_hits = [f for f in vision_frames if f.get("products")]
         logger.debug(
-            "[4/5] Per-frame detections (%d frames with products):\n%s",
+            "[4/6] Per-frame detections (%d frames with products):\n%s",
             len(frames_with_hits),
             json.dumps(
                 [
@@ -653,7 +548,7 @@ async def run_pipeline(request_body: PipelineRequest):
             ),
         )
     except Exception as e:
-        logger.error("[4/5] Vision analysis failed: %s", e)
+        logger.error("[4/6] Vision analysis failed: %s", e)
         steps["vision"] = {"status": "failed", "error": str(e)}
         raise HTTPException(
             status_code=500,
@@ -665,7 +560,7 @@ async def run_pipeline(request_body: PipelineRequest):
     # ------------------------------------------------------------------
     merge_result = None
     try:
-        logger.info("[5/5] Merging vision detections with transcript...")
+        logger.info("[5/6] Merging vision detections with transcript...")
         merge_result = merge_results(
             vision_frames=vision_result.get("frames", []),
             transcript_data=transcript_data,   # None if transcript was skipped
@@ -681,7 +576,7 @@ async def run_pipeline(request_body: PipelineRequest):
             "brand_resolved_count": merge_summary.get("brand_resolved_count", 0),
         }
         logger.info(
-            "[5/5] Merge done — %d products, %d detections, %d brands resolved from transcript",
+            "[5/6] Merge done — %d products, %d detections, %d brands resolved from transcript",
             merge_summary.get("total_products", 0),
             merge_summary.get("total_detections", 0),
             merge_summary.get("brand_resolved_count", 0),
@@ -691,7 +586,7 @@ async def run_pipeline(request_body: PipelineRequest):
         final_detections = merge_result.get("detections", [])
         if final_detections:
             logger.info(
-                "[5/5] Final detections (%d):\n%s",
+                "[5/6] Final detections (%d):\n%s",
                 len(final_detections),
                 "\n".join(
                     f"  [{d.get('show_at', '?'):.1f}s → {d.get('hide_at', '?'):.1f}s] "
@@ -701,14 +596,14 @@ async def run_pipeline(request_body: PipelineRequest):
                 ),
             )
         else:
-            logger.info("[5/5] No detections in merged output.")
+            logger.info("[5/6] No detections in merged output.")
 
         logger.debug(
-            "[5/5] Full merged result:\n%s",
+            "[5/6] Full merged result:\n%s",
             json.dumps(merge_result, indent=2, default=str),
         )
     except Exception as e:
-        logger.error("[5/5] Merge step failed: %s", e)
+        logger.error("[5/6] Merge step failed: %s", e)
         steps["integration"] = {"status": "failed", "error": str(e)}
         # Non-fatal — still return vision + transcript raw results
 
@@ -886,6 +781,208 @@ async def debug_serper(q: str = Query(..., description="Search query to send to 
             }
             for i, r in enumerate(shopping)
         ],
+    }
+
+
+@app.get("/api/debug/vision-thinking")
+async def debug_vision_thinking(
+    video_id: str = Query(..., description="Video ID whose extracted frames to analyse"),
+    batch_index: int = Query(0, ge=0, description="Which batch of frames to test (0-indexed)"),
+    batch_size: int = Query(5, ge=1, le=20, description="Frames per batch"),
+    thinking_budget: int = Query(
+        2048, ge=0, le=24576,
+        description="Max tokens allocated to chain-of-thought (0 = thinking disabled)",
+    ),
+):
+    """
+    Debug endpoint: run Gemini Vision on one batch of already-extracted frames
+    and log the model's full chain-of-thought alongside the product detections.
+
+    Nothing is written to disk — this is read-only and purely for inspection.
+
+    Prerequisites:
+      - Frame extraction must have been run first for this video_id
+        (POST /api/youtube/pipeline or GET /api/youtube/frames).
+
+    Chain-of-thought is surfaced when ``thinking_budget > 0`` and the primary
+    model is Gemini 2.5 Flash/Pro.  Each thought is logged at DEBUG level and
+    also returned in the response so it is visible even without debug logging.
+
+    Example:
+        GET /api/debug/vision-thinking?video_id=vohu6FhcpLE&batch_index=0&thinking_budget=4096
+    """
+    import base64 as _base64
+
+    from google import genai as _genai
+    from google.genai import types as _types
+    from vision import GEMINI_MODEL, _build_prompt, _FRAMES_ROOT
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not set in .env")
+
+    # ------------------------------------------------------------------
+    # Load frames from disk
+    # ------------------------------------------------------------------
+    frames_json_path = _FRAMES_ROOT / video_id / "frames.json"
+    if not frames_json_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No frames found for video_id='{video_id}'. "
+                f"Run frame extraction first (POST /api/youtube/pipeline)."
+            ),
+        )
+
+    meta = json.loads(frames_json_path.read_text(encoding="utf-8"))
+    all_frame_metas = meta.get("frames", [])
+    total_batches = max(1, (len(all_frame_metas) + batch_size - 1) // batch_size)
+
+    if batch_index >= total_batches:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"batch_index={batch_index} is out of range — "
+                f"this video has {total_batches} batch(es) of size {batch_size}."
+            ),
+        )
+
+    start = batch_index * batch_size
+    batch_metas = all_frame_metas[start : start + batch_size]
+
+    # Load images from disk
+    frames = []
+    missing = []
+    for fm in batch_metas:
+        fp = Path(fm["frame_path"])
+        if not fp.exists():
+            missing.append(str(fp))
+            continue
+        with open(fp, "rb") as fh:
+            b64 = _base64.b64encode(fh.read()).decode("utf-8")
+        frames.append({"timestamp": fm["timestamp"], "frame_path": str(fp), "frame_b64": b64})
+
+    if not frames:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No frame files found on disk for batch {batch_index}. Missing: {missing}",
+        )
+
+    # ------------------------------------------------------------------
+    # Build Gemini request — with optional thinking enabled
+    # ------------------------------------------------------------------
+    num_frames = len(frames)
+    parts: list = [_types.Part.from_text(text=_build_prompt(num_frames))]
+    for frame in frames:
+        image_bytes = _base64.b64decode(frame["frame_b64"])
+        parts.append(_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+
+    contents = [_types.Content(parts=parts, role="user")]
+
+    thinking_cfg = None
+    if thinking_budget > 0:
+        thinking_cfg = _types.ThinkingConfig(
+            thinking_budget=thinking_budget,
+            include_thoughts=True,
+        )
+
+    cfg = _types.GenerateContentConfig(
+        # NOTE: we omit response_mime_type="application/json" here so that
+        # thinking parts are not suppressed by strict JSON output mode.
+        # The final answer is still expected to be valid JSON by the prompt.
+        thinking_config=thinking_cfg,
+    )
+
+    logger.info(
+        "debug/vision-thinking: video_id=%s  batch=%d/%d  frames=%d  "
+        "model=%s  thinking_budget=%d",
+        video_id, batch_index, total_batches - 1, num_frames,
+        GEMINI_MODEL, thinking_budget,
+    )
+
+    # ------------------------------------------------------------------
+    # Call Gemini
+    # ------------------------------------------------------------------
+    client = _genai.Client(api_key=api_key)
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL, contents=contents, config=cfg,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
+
+    # ------------------------------------------------------------------
+    # Separate thought parts from the answer part
+    # ------------------------------------------------------------------
+    thought_texts: list[str] = []
+    answer_texts: list[str] = []
+
+    candidate = response.candidates[0] if response.candidates else None
+    if candidate:
+        for part in candidate.content.parts:
+            text = getattr(part, "text", "") or ""
+            if getattr(part, "thought", False):
+                thought_texts.append(text)
+            else:
+                answer_texts.append(text)
+
+    full_thought = "\n\n".join(thought_texts).strip()
+    full_answer  = "\n".join(answer_texts).strip()
+
+    # Log chain-of-thought so it appears in the server log even without
+    # looking at the HTTP response
+    if full_thought:
+        logger.debug(
+            "🧠 [vision-thinking] Chain-of-thought for batch %d/%d:\n%s",
+            batch_index, total_batches - 1, full_thought,
+        )
+        logger.info(
+            "🧠 [vision-thinking] Thinking summary: %d chars of reasoning for %d frame(s)",
+            len(full_thought), num_frames,
+        )
+    else:
+        logger.info(
+            "🧠 [vision-thinking] No thinking output returned "
+            "(model=%s may not support thinking, or thinking_budget=0)",
+            GEMINI_MODEL,
+        )
+
+    # Parse the JSON answer so we can surface it cleanly
+    parsed_answer = None
+    parse_error = None
+    raw_for_parse = full_answer.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    try:
+        parsed_answer = json.loads(raw_for_parse)
+        logger.info(
+            "🔍 [vision-thinking] Parsed answer for batch %d — %d frame result(s)",
+            batch_index, len(parsed_answer) if isinstance(parsed_answer, list) else 1,
+        )
+        logger.debug("🔍 [vision-thinking] Parsed answer:\n%s", json.dumps(parsed_answer, indent=2))
+    except json.JSONDecodeError as e:
+        parse_error = str(e)
+        logger.warning("🔍 [vision-thinking] Could not parse answer as JSON: %s", parse_error)
+
+    return {
+        "video_id":     video_id,
+        "model":        GEMINI_MODEL,
+        "batch_index":  batch_index,
+        "total_batches": total_batches,
+        "frames_in_batch": [
+            {"timestamp": f["timestamp"], "frame_path": f["frame_path"]}
+            for f in frames
+        ],
+        "missing_frame_files": missing,
+        "thinking": {
+            "enabled":       thinking_budget > 0,
+            "budget_tokens": thinking_budget,
+            "char_count":    len(full_thought),
+            "text":          full_thought or None,
+        },
+        "answer": {
+            "raw":          full_answer,
+            "parsed":       parsed_answer,
+            "parse_error":  parse_error,
+        },
     }
 
 
